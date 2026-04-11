@@ -717,11 +717,21 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     log(f"  Loading in {a.dtype}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        a.model, trust_remote_code=True, low_cpu_mem_usage=True,
-        dtype=load_dtype
-    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            a.model, trust_remote_code=True, low_cpu_mem_usage=True
+        )
+        log(f"  Model loaded on CPU, converting to {a.dtype}...")
+        if load_dtype != torch.float32:
+            model = model.to(dtype=load_dtype)
+    except Exception as e:
+        print(f"  FATAL during model loading: {e}", flush=True)
+        traceback.print_exc()
+        return
     model.eval()
+    log(f"  Moving to {DEVICE}...")
     model = model.to(DEVICE)
     dtype = next(model.parameters()).dtype
     np_ = sum(p.numel() for p in model.parameters())
