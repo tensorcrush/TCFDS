@@ -717,45 +717,43 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     log(f"  Loading in {a.dtype}...")
-    print(f"  [DEBUG] Attempting from_pretrained...", flush=True)
 
-    # Strategy: try loading directly to GPU in float16 to minimize RAM usage
+    # Load model — prioritise the lightest strategy first (no torch_dtype at
+    # load time avoids Windows page-file blow-up observed on 16 GB machines).
+    # dtype conversion happens *after* the model is in memory.
     model = None
-    for attempt, kwargs in enumerate([
-        # Attempt 1: direct to CUDA in target dtype (needs accelerate)
-        dict(device_map=DEVICE if DEVICE.type == 'cuda' else None,
-             torch_dtype=load_dtype, low_cpu_mem_usage=True),
-        # Attempt 2: CPU in target dtype
-        dict(torch_dtype=load_dtype, low_cpu_mem_usage=True),
-        # Attempt 3: CPU default dtype, no extras
-        dict(),
-    ], start=1):
+    strategies = [
+        ("CPU-lowmem", dict(low_cpu_mem_usage=True)),
+        ("CPU-minimal", dict()),
+    ]
+
+    for name, kwargs in strategies:
         try:
-            # Filter out None values
-            kwargs = {k: v for k, v in kwargs.items() if v is not None}
-            print(f"  [DEBUG] Attempt {attempt}: {kwargs}", flush=True)
+            log(f"  Strategy: {name}...")
             model = AutoModelForCausalLM.from_pretrained(
                 a.model, trust_remote_code=True, **kwargs
             )
-            print(f"  [DEBUG] Attempt {attempt} succeeded!", flush=True)
+            log(f"  Model loaded via {name}")
             break
         except Exception as e:
-            print(f"  [DEBUG] Attempt {attempt} failed: {e}", flush=True)
-            continue
+            log(f"  {name} failed: {e}")
+            model = None
+            free_mem()
 
     if model is None:
-        print("FATAL: Could not load model with any strategy.", flush=True)
+        print("FATAL: Could not load model. Try closing other apps or increasing", flush=True)
+        print("  Windows page file (sysdm.cpl > Advanced > Performance > Virtual Memory).", flush=True)
         return
 
     model.eval()
-    # Move to device if not already there
-    model_device = next(model.parameters()).device
-    if model_device != DEVICE:
+    # Convert dtype on CPU first (avoids double-memory on GPU), then move
+    if next(model.parameters()).dtype != load_dtype:
+        log(f"  Converting to {a.dtype} on CPU...")
+        model = model.to(dtype=load_dtype)
+        free_mem()
+    if next(model.parameters()).device.type != DEVICE.type:
         log(f"  Moving to {DEVICE}...")
-        if load_dtype != torch.float32:
-            model = model.to(device=DEVICE, dtype=load_dtype)
-        else:
-            model = model.to(DEVICE)
+        model = model.to(device=DEVICE)
     dtype = next(model.parameters()).dtype
     np_ = sum(p.numel() for p in model.parameters())
     bpe = 2 if dtype in (torch.float16, torch.bfloat16) else 4
