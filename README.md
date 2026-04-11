@@ -6,7 +6,7 @@
 
 **Compression par Feuilletage Dynamique Spectral**
 
-TCFDS compresses large language models by replacing dense weight matrices with low-rank factored representations, guided by actual input activation statistics. Unlike quantization methods that reduce bit precision, TCFDS performs **structural compression** — it reduces the number of parameters by exploiting the low spectral entropy of weight matrices. The result: up to 7x smaller models that preserve output quality, with no fine-tuning required.
+TCFDS compresses large language models by replacing dense weight matrices with low-rank factored representations, guided by actual input activation statistics. Unlike quantization methods that reduce bit precision, TCFDS performs **structural compression** — it reduces the number of parameters by exploiting the low spectral entropy of weight matrices. The result: 2-4x smaller models that preserve output quality (< 8% PPL increase), with no fine-tuning required.
 
 ---
 
@@ -103,7 +103,7 @@ Covariances are collected in a **single pass** (64 forward passes total, not 64 
 |---|---|---|---|---|---|---|---|
 | **Approach** | Data-aware SVD factorization | 2nd-order quantization | Activation-aware quantization | Low-rank adaptation | Quantized + LoRA | Non-uniform quantization | Additive quantization |
 | **Compression type** | Structural (fewer params) | Precision (fewer bits) | Precision (fewer bits) | Additive (extra params) | Precision + additive | Precision (fewer bits) | Precision (codebooks) |
-| **Typical ratio** | 2-7x | 2-4x (4-bit) | 2-4x (4-bit) | N/A (adds params) | 2-4x + adapters | 2-4x | 2-8x |
+| **Typical ratio** | 2-4x | 2-4x (4-bit) | 2-4x (4-bit) | N/A (adds params) | 2-4x + adapters | 2-4x | 2-8x |
 | **Requires fine-tuning** | No | No | No | Yes | Yes | No | Yes (codebook) |
 | **Calibration data** | Yes (64 sentences) | Yes (~128 samples) | Yes (~128 samples) | Training set | Training set | Yes | Yes |
 | **Error bound** | Spectral isometry (proven) | 2nd-order Taylor (approx.) | Empirical | Task-specific | Task-specific | Empirical | Empirical |
@@ -124,12 +124,14 @@ Covariances are collected in a **single pass** (64 forward passes total, not 64 
 ### Install
 
 ```bash
-pip install torch transformers numpy psutil
+pip install torch transformers numpy psutil datasets
 
 # With CUDA (recommended for faster compression)
 pip install torch --index-url https://download.pytorch.org/whl/cu118
-pip install transformers numpy psutil
+pip install transformers numpy psutil datasets
 ```
+
+> `datasets` is optional but recommended — it enables WikiText-2 calibration for better covariance estimates. Without it, TCFDS falls back to built-in calibration sentences.
 
 ### Compress a model
 
@@ -162,10 +164,10 @@ Epsilon (`eps`) controls the compression-quality tradeoff. It sets the spectral 
 | Epsilon | Compression | Quality | PPL Ratio | Use Case |
 |---------|-------------|---------|-----------|----------|
 | `0.08` | ~1.2x | Near-lossless | < 1.01 | Research / quality-critical |
-| `0.15` | ~2-3x | Excellent | < 1.05 | Production deployment |
-| `0.25` | ~5-7x | Good | < 1.20 | Balanced (default) |
-| `0.35` | ~7-10x | Acceptable | < 1.50 | Memory-constrained |
-| `0.50` | ~10x+ | Degraded | > 1.50 | Experimental only |
+| `0.15` | ~2x | Excellent | < 1.05 | Production deployment |
+| `0.25` | ~3-4x | Good | < 1.10 | Balanced (default) |
+| `0.35` | ~4-5x | Acceptable | < 1.25 | Memory-constrained |
+| `0.50` | ~5x+ | Degraded | > 1.25 | Experimental only |
 
 PPL ratio = perplexity_after / perplexity_before. A ratio of 1.05 means 5% quality loss.
 
@@ -177,14 +179,17 @@ Tested on **TinyLlama-1.1B-Chat-v1.0** (RTX 2060, 16 GB RAM):
 
 | Epsilon | Layers Compressed | Compression Ratio | PPL Before | PPL After | PPL Ratio | Time |
 |---------|-------------------|-------------------|------------|-----------|-----------|------|
-| 0.08 | 12 | ~1.2x | 35.83 | ~35.5 | ~0.99 | ~8 min |
-| 0.25 | 45 | **7.1x** | 35.83 | 41.44 | 1.16 | ~9.5 min |
-| 0.35 | ~60 | ~10x | 35.83 | ~58 | ~1.6 | ~10 min |
+| 0.08 | ~12 | ~1.2x | 35.83 | ~35.5 | ~0.99 | ~8 min |
+| 0.25 | 46 | **3.9x** | 35.83 | **38.65** | **1.08** | ~13 min |
+| 0.35 | ~60 | ~5x | 35.83 | ~45 | ~1.25 | ~14 min |
+
+Calibrated with **WikiText-2** (32 chunks of 256 tokens). The richer calibration data produces better covariance estimates, resulting in higher-rank approximations that preserve quality.
 
 Layer-level observations:
 - **Attention projections** (`q_proj`, `k_proj`) are highly compressible (low spectral entropy, data-aware error < 0.15)
 - **Value/output projections** (`v_proj`, `o_proj`) are moderately compressible but sensitive — quality-guarded at data_err > 0.16
-- **MLP layers** (`gate_proj`, `up_proj`, `down_proj`) are harder to compress, most are skipped by the quality guard
+- **MLP layers** (`gate_proj`, `up_proj`, `down_proj`) are harder to compress with data-aware SVD, most are skipped
+- **Edge layers** (first/last 2 blocks) use halved epsilon for extra protection
 
 ---
 

@@ -270,80 +270,55 @@ class TCFDSLinear(nn.Module):
         t = self.U.numel() + self.S.numel() + self.V.numel()
         return t + (self.bias.numel() if self.bias is not None else 0)
 
-# === CALIBRATION TEXTS (64 diverse sentences) ===
+# === CALIBRATION DATA ===
 
-CALIBRATION_TEXTS = [
-    "The transformer architecture uses self-attention mechanisms to process sequences.",
-    "In mathematics, differential geometry studies smooth manifolds and their properties.",
-    "Machine learning models require large amounts of training data to generalize well.",
-    "Neural networks consist of layers of interconnected nodes that transform data.",
-    "The history of computing spans from mechanical calculators to quantum processors.",
-    "Natural language processing enables computers to understand human communication.",
-    "Quantum mechanics describes the behavior of particles at the atomic scale.",
-    "The theory of relativity changed our understanding of space and time fundamentally.",
-    "Photosynthesis converts sunlight into chemical energy in plant cells efficiently.",
-    "DNA stores genetic information using four nucleotide bases in a double helix.",
-    "The periodic table organizes elements by atomic number and chemical properties.",
-    "Entropy measures the disorder or randomness in a thermodynamic system.",
-    "Black holes are regions where gravity is so strong that nothing can escape.",
-    "Algorithms are step-by-step procedures for solving computational problems efficiently.",
-    "The internet connects billions of devices through standardized communication protocols.",
-    "Artificial intelligence aims to create systems that can perform human-like reasoning.",
-    "The Renaissance marked a period of cultural rebirth in Europe during the fourteenth century.",
-    "Democracy originated in ancient Athens where citizens voted on laws directly.",
-    "The Industrial Revolution transformed manufacturing through mechanization and steam power.",
-    "World War Two was the deadliest conflict in human history claiming millions of lives.",
-    "The Roman Empire dominated the Mediterranean world for several centuries before declining.",
-    "The French Revolution abolished the monarchy and established republican government.",
-    "Ancient Egypt built massive pyramids as tombs for their pharaohs thousands of years ago.",
-    "The Silk Road connected East and West through trade routes across Central Asia.",
-    "Shakespeare wrote many plays and sonnets that remain widely performed today worldwide.",
-    "Philosophy examines fundamental questions about existence, knowledge, and morality.",
-    "The quick brown fox jumps over the lazy dog near the river bank.",
-    "Once upon a time in a distant kingdom there lived a wise old wizard.",
-    "Books have been the primary medium for preserving and transmitting knowledge for centuries.",
-    "Poetry uses rhythm, imagery, and figurative language to evoke emotions in readers.",
-    "Socrates taught his students through questions rather than direct instruction.",
-    "The printing press revolutionized the spread of information across European societies.",
-    "Cooking a good meal requires fresh ingredients and careful attention to timing.",
-    "Regular exercise improves cardiovascular health and reduces the risk of chronic diseases.",
-    "Climate change threatens ecosystems worldwide through rising temperatures and sea levels.",
-    "Education provides individuals with skills and knowledge needed for productive careers.",
-    "Music has the power to influence emotions and bring people together across cultures.",
-    "Architecture combines artistic vision with engineering principles to create functional spaces.",
-    "Transportation systems move people and goods efficiently across cities and countries.",
-    "Agriculture feeds the global population through crop cultivation and animal husbandry.",
-    "The function takes an input tensor and returns the compressed representation efficiently.",
-    "Memory management is critical in systems programming to prevent leaks and corruption.",
-    "Databases store structured information that can be queried using specialized languages.",
-    "Cloud computing provides scalable resources for processing large datasets remotely.",
-    "Version control systems track changes to source code across multiple developers.",
-    "Operating systems manage hardware resources and provide services to application software.",
-    "Compilers translate high-level programming languages into machine-executable instructions.",
-    "Encryption protects sensitive data by transforming it into unreadable ciphertext.",
-    "A matrix is a rectangular array of numbers arranged in rows and columns.",
-    "The eigenvalues of a symmetric matrix are always real numbers by the spectral theorem.",
-    "Integration calculates the area under a curve defined by a continuous function.",
-    "Probability theory provides the mathematical framework for reasoning about uncertain events.",
-    "Graph theory studies the properties of networks consisting of nodes and edges.",
-    "Topology studies properties of shapes that are preserved under continuous deformations.",
-    "Linear algebra provides tools for solving systems of equations and analyzing transformations.",
-    "Statistics enables inference about populations based on samples of observed data.",
-    "The cat sat on the mat and watched the birds fly across the garden.",
-    "In the year two thousand twenty-six, many technological advances were made globally.",
-    "Paris is the capital of France, known for the Eiffel Tower and its cuisine.",
-    "The ocean covers more than seventy percent of the Earth's surface with saltwater.",
-    "Mountains are formed by tectonic plate collisions that push rock upward over time.",
-    "Rivers carry water and sediment from highlands to the sea through erosion.",
-    "Forests provide habitat for wildlife and play a crucial role in carbon sequestration.",
-    "Cities are complex systems that require infrastructure for water, energy, and transport.",
+# Fallback: short diverse sentences (used when WikiText-2 is unavailable)
+_FALLBACK_CALIBRATION_TEXTS = [
+    "The transformer architecture uses self-attention mechanisms to process sequences in parallel.",
+    "In mathematics, differential geometry studies smooth manifolds and their curvature properties.",
+    "Machine learning models require large amounts of diverse training data to generalize well.",
+    "Quantum mechanics describes the behavior of particles at the subatomic scale precisely.",
+    "The theory of relativity fundamentally changed our understanding of space, time, and gravity.",
+    "DNA stores genetic information using four nucleotide bases arranged in a double helix.",
+    "Algorithms are step-by-step procedures for solving computational problems efficiently and correctly.",
+    "The internet connects billions of devices worldwide through standardized communication protocols.",
 ]
+
+def _load_calibration_texts(tokenizer, n_samples=32, seq_len=256):
+    """Load calibration data from WikiText-2 (preferred) or fallback to hardcoded texts.
+    Returns list of token-ready text chunks of ~seq_len tokens each."""
+    # Try WikiText-2 from HuggingFace datasets
+    try:
+        from datasets import load_dataset
+        log(f"  Loading WikiText-2 ({n_samples} x {seq_len} tokens)...")
+        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        # Concatenate all text, then chunk into seq_len-token pieces
+        all_text = "\n".join(t for t in ds["text"] if len(t.strip()) > 50)
+        # Tokenize once to find chunk boundaries
+        tokens = tokenizer(all_text, return_tensors="pt", truncation=False)["input_ids"][0]
+        chunks = []
+        for i in range(0, len(tokens) - seq_len, seq_len):
+            chunk_ids = tokens[i:i + seq_len]
+            chunks.append(tokenizer.decode(chunk_ids, skip_special_tokens=True))
+            if len(chunks) >= n_samples:
+                break
+        if len(chunks) >= n_samples // 2:
+            log(f"  WikiText-2: {len(chunks)} chunks of ~{seq_len} tokens")
+            return chunks, seq_len
+        log(f"  WikiText-2: only {len(chunks)} chunks, falling back to hardcoded texts")
+    except Exception as e:
+        log(f"  WikiText-2 unavailable ({e}), using fallback calibration texts")
+
+    return _FALLBACK_CALIBRATION_TEXTS, 64
 
 # === STREAMING COVARIANCE (per-block, not all-at-once) ===
 
-def collect_covs_for_layers(model, tokenizer, layer_names, seq_len=64):
+def collect_covs_for_layers(model, tokenizer, layer_names, calib_texts=None, seq_len=256):
     """Collect input activation covariance matrices for the given layers.
     Covariances are accumulated on CPU to avoid VRAM pressure."""
+    if calib_texts is None:
+        calib_texts = _FALLBACK_CALIBRATION_TEXTS
+        seq_len = 64
     covs, tcounts, hooks = {}, {}, []
     target = set(layer_names)
     dev = next(model.parameters()).device
@@ -365,7 +340,7 @@ def collect_covs_for_layers(model, tokenizer, layer_names, seq_len=64):
     model.eval()
     n_errors = 0
     with torch.no_grad():
-        for i, text in enumerate(CALIBRATION_TEXTS):
+        for i, text in enumerate(calib_texts):
             ids = tokenizer(text, return_tensors="pt", truncation=True, max_length=seq_len)
             ids = {k: v.to(dev) for k, v in ids.items()}
             try:
@@ -481,11 +456,15 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
     results, tot_orig, tot_comp, layer_idx = [], 0, 0, 0
     t0 = time.time()
 
-    # Collect ALL covariances in a single pass (64 forward passes total,
-    # not 64 * num_blocks). This is the single biggest speedup.
+    # Load calibration data (WikiText-2 if available, else fallback)
+    calib_texts, calib_seq_len = _load_calibration_texts(tokenizer)
+
+    # Collect ALL covariances in a single pass
     all_layer_names = [n for _, layers in block_groups for n, _ in layers]
     log(f"  Collecting covariances for {len(all_layer_names)} layers (single pass)...")
-    all_covs = collect_covs_for_layers(model, tokenizer, all_layer_names)
+    all_covs = collect_covs_for_layers(model, tokenizer, all_layer_names,
+                                       calib_texts=calib_texts, seq_len=calib_seq_len)
+    del calib_texts
     cov_mb = sum(c.numel() * 4 / 1e6 for c in all_covs.values())
     log(f"  Covariances: {len(all_covs)}/{len(all_layer_names)} ({cov_mb:.0f} MB)")
 
@@ -505,6 +484,15 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
                 aeps = base_eps * (0.3 + 1.7 * (1.0 - s))
                 aeps = max(0.02, min(aeps, base_eps * 1.5))
 
+                # Epsilon scheduling: tighter eps for first/last 2 blocks
+                # (these layers are empirically the most sensitive)
+                n_blocks = len(block_groups)
+                m_block = re.search(r'\.layers\.(\d+)\.', name)
+                if m_block:
+                    blk_idx = int(m_block.group(1))
+                    if blk_idx < 2 or blk_idx >= n_blocks - 2:
+                        aeps *= 0.5  # halve epsilon for edge layers
+
                 # Extract weight in float32 for SVD
                 w32 = mod.weight.data.float().cpu()
                 b32 = mod.bias.data.float().cpu() if mod.bias is not None else None
@@ -520,13 +508,34 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
                     del tcfds
                     continue
 
-                # Quality guard: use data-aware error (measures actual impact on
-                # model outputs) when available, Frobenius error otherwise
-                err = tcfds.data_err if (cov is not None and tcfds.data_err != tcfds.rel_err) else tcfds.rel_err
-                if err > 0.16:
-                    log(f"  [{layer_idx}/{total_layers}] {name:<38} SKIP (err {err:.3f} > 0.16)")
+                # Hard Frobenius cap: never compress if we lose >90% of weight energy
+                if tcfds.rel_err > 0.90:
+                    log(f"  [{layer_idx}/{total_layers}] {name:<38} SKIP (frob {tcfds.rel_err:.3f} > 0.90)")
                     del tcfds
                     continue
+
+                # Quality guard: use data-aware error when available
+                err = tcfds.data_err if (cov is not None and tcfds.data_err != tcfds.rel_err) else tcfds.rel_err
+                if err > 0.16:
+                    # Borderline layer — retry with tighter eps (higher rank)
+                    if err < 0.30 and tcfds.compression > 1.5:
+                        retry_eps = aeps * 0.4  # much tighter
+                        del tcfds
+                        w32_r = mod.weight.data.float().cpu()
+                        b32_r = mod.bias.data.float().cpu() if mod.bias is not None else None
+                        tcfds = TCFDSLinear.from_weight(w32_r, b32_r, retry_eps, store_dtype, Cov=cov)
+                        del w32_r, b32_r
+                        err2 = tcfds.data_err if (cov is not None and tcfds.data_err != tcfds.rel_err) else tcfds.rel_err
+                        if err2 > 0.16 or tcfds.compression < 1.05:
+                            log(f"  [{layer_idx}/{total_layers}] {name:<38} SKIP (err {err:.3f}->{err2:.3f}, retry failed)")
+                            del tcfds
+                            continue
+                        # Retry succeeded — use the tighter version
+                        svd_t = time.time() - t1  # update timing
+                    else:
+                        log(f"  [{layer_idx}/{total_layers}] {name:<38} SKIP (err {err:.3f} > 0.16)")
+                        del tcfds
+                        continue
 
                 orig_p = m * n + (m if mod.bias is not None else 0)
                 tot_orig += orig_p

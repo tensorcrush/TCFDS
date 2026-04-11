@@ -2,3 +2,4 @@ torch>=2.0
 transformers>=4.30
 numpy
 psutil
+datasets  # optional: enables WikiText-2 calibration

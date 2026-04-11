@@ -35,6 +35,9 @@ dependencies = [
     "psutil",
 ]
 
+[project.optional-dependencies]
+full = ["datasets"]  # WikiText-2 calibration
+
 [project.urls]
 Homepage = "https://github.com/tensorcrush/TCFDS"
 Repository = "https://github.com/tensorcrush/TCFDS"
