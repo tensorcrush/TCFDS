@@ -96,6 +96,8 @@ def _do_svd(W, eps, total_energy, force_cpu=False):
     m, n = W.shape
     threshold = 1.0 - eps**2 / 2.0
     device = W.device
+    # Minimum rank: at least 16, or 1/64th of smallest dimension
+    min_rank = max(16, min(m, n) // 64)
 
     # For large matrices, force CPU to avoid GPU segfaults
     if force_cpu and W.device.type != 'cpu':
@@ -107,7 +109,7 @@ def _do_svd(W, eps, total_energy, force_cpu=False):
     reached = (ecum >= threshold)
 
     if reached.any():
-        k = max(int(reached.float().argmax().item()) + 1, 2)  # minimum rank 2
+        k = max(int(reached.float().argmax().item()) + 1, min_rank)
     else:
         # Probe didn't reach threshold — full SVD needed
         del U_p, S_p, V_p
@@ -116,7 +118,7 @@ def _do_svd(W, eps, total_energy, force_cpu=False):
         ecum_f = (S_f**2).cumsum(0) / total_energy
         reached_f = (ecum_f >= threshold)
         k = int(reached_f.float().argmax().item()) + 1 if reached_f.any() else min(m, n)
-        k = max(k, 2)
+        k = max(k, min_rank)
         U_out = U_f[:, :k].to(device)
         S_out = S_f[:k].to(device)
         Vh_out = Vh_f[:k].to(device)
@@ -478,7 +480,7 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
             try:
                 s = sensitivities.get(name, 0.5)
                 aeps = base_eps * (0.3 + 1.7 * (1.0 - s))
-                aeps = max(0.02, min(aeps, base_eps * 2.5))
+                aeps = max(0.02, min(aeps, base_eps * 1.5))
 
                 # Extract weight to CPU for SVD
                 w32 = mod.weight.data.float().cpu()
@@ -492,6 +494,11 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
 
                 if tcfds.compression < 1.05:
                     log(f"  [{layer_idx}/{total_layers}] {name:<38} SKIP (ratio {tcfds.compression:.2f}x < 1.05)")
+                    del tcfds
+                    continue
+
+                if tcfds.rel_err > 0.5:
+                    log(f"  [{layer_idx}/{total_layers}] {name:<38} SKIP (frob_err {tcfds.rel_err:.3f} > 0.5)")
                     del tcfds
                     continue
 
