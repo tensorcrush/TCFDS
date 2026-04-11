@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tcfds"
+version = "6.3.0"
+description = "Data-aware spectral compression for Large Language Models"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "tensorcrush"}
+]
+keywords = [
+    "llm", "compression", "svd", "low-rank", "factorization",
+    "transformers", "pytorch", "deep-learning", "model-compression"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "numpy",
+    "psutil",
+]
+
+[project.urls]
+Homepage = "https://github.com/tensorcrush/TCFDS"
+Repository = "https://github.com/tensorcrush/TCFDS"
+Paper = "https://github.com/tensorcrush/TCFDS/blob/main/paper/tcfds_paper.pdf"
+
+[project.scripts]
+tcfds = "tcfds:main"
+
+[tool.setuptools]
+py-modules = ["tcfds"]

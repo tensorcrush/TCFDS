@@ -226,11 +226,12 @@ Compression is verified with 3 structural checks:
 2. **Memory reduced** — Total parameter count after compression is strictly less than before.
 3. **Structured SVD** — Singular value ratios exceed 10, confirming the decomposition captures real structure (not random noise).
 
-Standalone verification:
+Standalone verification after loading a compressed model:
 
 ```python
-from scripts.verify import verify_compression
-report = verify_compression(model)  # Returns JSON with per-layer metrics
+# Built into tcfds.py
+python tcfds.py --load compressed.pt
+# Runs all 3 checks automatically before entering chat
 ```
 
 ---
@@ -252,16 +253,13 @@ The streaming compression pipeline limits peak memory to ~230 MB per block regar
 
 ```
 tcfds/
-├── tcfds.py                # Main compression script (v6.2)
-├── scripts/
-│   └── verify.py           # Standalone verification module
-├── examples/
-│   └── test_load.py        # Model loading test
+├── tcfds.py              # Main compression script (v6.3)
 ├── paper/
-│   ├── tcfds_paper.tex     # Research paper (LaTeX source)
-│   └── tcfds_paper.pdf     # Research paper (compiled)
-├── requirements.txt
-├── LICENSE
+│   ├── tcfds_paper.tex   # Research paper (LaTeX source)
+│   └── tcfds_paper.pdf   # Research paper (compiled)
+├── pyproject.toml        # Python packaging metadata
+├── requirements.txt      # Dependencies
+├── LICENSE               # MIT
 ├── .gitignore
 └── README.md
 ```
