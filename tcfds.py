@@ -668,7 +668,13 @@ def main():
                     help="Path to load a previously compressed model")
     pa.add_argument("--chat-only", action="store_true",
                     help="Skip verification, go straight to chat")
+    pa.add_argument("--dtype", type=str, default="float16",
+                    choices=["float16", "float32", "bfloat16"],
+                    help="Model precision (float16 saves RAM, default: float16)")
     a = pa.parse_args()
+
+    dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
+    load_dtype = dtype_map[a.dtype]
 
     print("=" * 65)
     print(f"  TCFDS v6.3 (Data-Aware + GPU + Memory Safety) | eps={a.eps}")
@@ -710,8 +716,10 @@ def main():
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    log(f"  Loading in {a.dtype}...")
     model = AutoModelForCausalLM.from_pretrained(
-        a.model, trust_remote_code=True, low_cpu_mem_usage=True
+        a.model, trust_remote_code=True, low_cpu_mem_usage=True,
+        torch_dtype=load_dtype
     )
     model.eval()
     model = model.to(DEVICE)
