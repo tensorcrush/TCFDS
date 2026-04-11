@@ -16,7 +16,7 @@ Usage:
 """
 
 import torch, torch.nn as nn
-import math, time, gc, sys, os, json, hashlib, traceback, argparse, re
+import math, time, gc, os, json, hashlib, traceback, argparse, re
 import numpy as np
 from collections import defaultdict
 
@@ -556,7 +556,7 @@ def save_compressed(model, results, meta, path):
 
 def load_compressed(path):
     log(f"  Loading {path}...")
-    data = torch.load(path, map_location='cpu', weights_only=False)
+    data = torch.load(path, map_location='cpu', weights_only=True)
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
     mn = data['model_name']
     tok = AutoTokenizer.from_pretrained(mn, trust_remote_code=True)
