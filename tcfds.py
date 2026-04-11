@@ -717,22 +717,45 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     log(f"  Loading in {a.dtype}...")
-    sys.stdout.flush()
-    sys.stderr.flush()
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            a.model, trust_remote_code=True, low_cpu_mem_usage=True
-        )
-        log(f"  Model loaded on CPU, converting to {a.dtype}...")
-        if load_dtype != torch.float32:
-            model = model.to(dtype=load_dtype)
-    except Exception as e:
-        print(f"  FATAL during model loading: {e}", flush=True)
-        traceback.print_exc()
+    print(f"  [DEBUG] Attempting from_pretrained...", flush=True)
+
+    # Strategy: try loading directly to GPU in float16 to minimize RAM usage
+    model = None
+    for attempt, kwargs in enumerate([
+        # Attempt 1: direct to CUDA in target dtype (needs accelerate)
+        dict(device_map=DEVICE if DEVICE.type == 'cuda' else None,
+             torch_dtype=load_dtype, low_cpu_mem_usage=True),
+        # Attempt 2: CPU in target dtype
+        dict(torch_dtype=load_dtype, low_cpu_mem_usage=True),
+        # Attempt 3: CPU default dtype, no extras
+        dict(),
+    ], start=1):
+        try:
+            # Filter out None values
+            kwargs = {k: v for k, v in kwargs.items() if v is not None}
+            print(f"  [DEBUG] Attempt {attempt}: {kwargs}", flush=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                a.model, trust_remote_code=True, **kwargs
+            )
+            print(f"  [DEBUG] Attempt {attempt} succeeded!", flush=True)
+            break
+        except Exception as e:
+            print(f"  [DEBUG] Attempt {attempt} failed: {e}", flush=True)
+            continue
+
+    if model is None:
+        print("FATAL: Could not load model with any strategy.", flush=True)
         return
+
     model.eval()
-    log(f"  Moving to {DEVICE}...")
-    model = model.to(DEVICE)
+    # Move to device if not already there
+    model_device = next(model.parameters()).device
+    if model_device != DEVICE:
+        log(f"  Moving to {DEVICE}...")
+        if load_dtype != torch.float32:
+            model = model.to(device=DEVICE, dtype=load_dtype)
+        else:
+            model = model.to(DEVICE)
     dtype = next(model.parameters()).dtype
     np_ = sum(p.numel() for p in model.parameters())
     bpe = 2 if dtype in (torch.float16, torch.bfloat16) else 4
