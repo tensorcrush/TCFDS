@@ -674,7 +674,7 @@ def main():
     print(f"  TCFDS v6.3 (Data-Aware + GPU + Memory Safety) | eps={a.eps}")
     print(f"  Device: {DEVICE}" + (f" ({torch.cuda.get_device_name(0)})" if torch.cuda.is_available() else ""))
     if torch.cuda.is_available():
-        total_vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+        total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"  VRAM: {total_vram:.1f} GB total")
     print("=" * 65)
 
