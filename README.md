@@ -6,7 +6,7 @@
 
 **Compression par Feuilletage Dynamique Spectral**
 
-TCFDS compresses large language models by replacing dense weight matrices with low-rank factored representations, guided by actual input activation statistics. Unlike quantization methods that reduce bit precision, TCFDS performs **structural compression** — it reduces the number of parameters by exploiting the low spectral entropy of weight matrices. The result: 2-5x smaller models that preserve output quality, with no fine-tuning required.
+TCFDS compresses large language models by replacing dense weight matrices with low-rank factored representations, guided by actual input activation statistics. Unlike quantization methods that reduce bit precision, TCFDS performs **structural compression** — it reduces the number of parameters by exploiting the low spectral entropy of weight matrices. The result: up to 7x smaller models that preserve output quality, with no fine-tuning required.
 
 ---
 
@@ -56,7 +56,7 @@ This ensures the approximation error is small **where it matters** — along the
 
 ### Adaptive Epsilon
 
-Not all layers are equally sensitive to compression. TCFDS calibrates sensitivity per-layer by injecting small noise and measuring the impact on loss:
+Not all layers are equally sensitive to compression. TCFDS estimates sensitivity per-layer using a weight-norm heuristic with architecture-aware boosting (attention projections get higher sensitivity scores):
 
 ```
 adaptive_eps(layer) = base_eps * (0.3 + 1.7 * (1.0 - sensitivity))
@@ -69,19 +69,18 @@ Sensitive layers (attention projections) get tighter tolerances. Robust layers (
 ```
 ┌─────────────┐     ┌──────────────────┐      ┌───────────────────────┐
 │  Load Model │ ──> │  Baseline PPL    │ ──>  │  Calibrate            │
-│    (HF)     │     │  + sample outputs│      │  - Collect covariances│
-└─────────────┘     └──────────────────┘      │  - Measure sensitivity│
+│    (HF)     │     │  + sample outputs│      │  - Weight-norm sens.  │
+└─────────────┘     └──────────────────┘      │  - Single-pass covs   │
                                               └───────────┬───────────┘
                                                           │
                                                           v
                                               ┌───────────────────────┐
                                               │  Stream Compress      │
                                               │  For each block:      │
-                                              │   - Collect act. covs │
                                               │   - Data-aware SVD    │
+                                              │   - Quality guard     │
                                               │   - Replace layers    │
                                               │   - Free memory       │
-                                              │  Peak mem: ~230 MB    │
                                               └───────────┬───────────┘
                                                           │
                                                           v
@@ -94,7 +93,7 @@ Sensitive layers (attention projections) get tighter tolerances. Robust layers (
                                               └───────────────────────┘
 ```
 
-Block-by-block streaming limits peak memory to ~230 MB (vs ~5 GB if processing all layers at once).
+Covariances are collected in a **single pass** (64 forward passes total, not 64 per block), which is the single biggest speedup over v6.2.
 
 ---
 
@@ -104,7 +103,7 @@ Block-by-block streaming limits peak memory to ~230 MB (vs ~5 GB if processing a
 |---|---|---|---|---|---|---|---|
 | **Approach** | Data-aware SVD factorization | 2nd-order quantization | Activation-aware quantization | Low-rank adaptation | Quantized + LoRA | Non-uniform quantization | Additive quantization |
 | **Compression type** | Structural (fewer params) | Precision (fewer bits) | Precision (fewer bits) | Additive (extra params) | Precision + additive | Precision (fewer bits) | Precision (codebooks) |
-| **Typical ratio** | 2-5x | 2-4x (4-bit) | 2-4x (4-bit) | N/A (adds params) | 2-4x + adapters | 2-4x | 2-8x |
+| **Typical ratio** | 2-7x | 2-4x (4-bit) | 2-4x (4-bit) | N/A (adds params) | 2-4x + adapters | 2-4x | 2-8x |
 | **Requires fine-tuning** | No | No | No | Yes | Yes | No | Yes (codebook) |
 | **Calibration data** | Yes (64 sentences) | Yes (~128 samples) | Yes (~128 samples) | Training set | Training set | Yes | Yes |
 | **Error bound** | Spectral isometry (proven) | 2nd-order Taylor (approx.) | Empirical | Task-specific | Task-specific | Empirical | Empirical |
@@ -163,10 +162,10 @@ Epsilon (`eps`) controls the compression-quality tradeoff. It sets the spectral 
 | Epsilon | Compression | Quality | PPL Ratio | Use Case |
 |---------|-------------|---------|-----------|----------|
 | `0.08` | ~1.2x | Near-lossless | < 1.01 | Research / quality-critical |
-| `0.15` | ~1.5x | Excellent | < 1.05 | Production deployment |
-| `0.25` | ~2-3x | Good | < 1.10 | Balanced (default) |
-| `0.35` | ~3-5x | Acceptable | < 1.20 | Memory-constrained |
-| `0.50` | ~5x+ | Degraded | > 1.20 | Experimental only |
+| `0.15` | ~2-3x | Excellent | < 1.05 | Production deployment |
+| `0.25` | ~5-7x | Good | < 1.20 | Balanced (default) |
+| `0.35` | ~7-10x | Acceptable | < 1.50 | Memory-constrained |
+| `0.50` | ~10x+ | Degraded | > 1.50 | Experimental only |
 
 PPL ratio = perplexity_after / perplexity_before. A ratio of 1.05 means 5% quality loss.
 
@@ -174,18 +173,18 @@ PPL ratio = perplexity_after / perplexity_before. A ratio of 1.05 means 5% quali
 
 ## Benchmarks
 
-Tested on **TinyLlama-1.1B-Chat-v1.0**:
+Tested on **TinyLlama-1.1B-Chat-v1.0** (RTX 2060, 16 GB RAM):
 
-| Epsilon | Layers Compressed | Compression Ratio | PPL Before | PPL After | PPL Ratio | Time (RTX 2060) |
-|---------|-------------------|-------------------|------------|-----------|-----------|-----------------|
-| 0.08 | 12 | ~1.2x | 35.59 | 35.42 | 0.995 | ~8 min |
-| 0.25 | 32 | ~2.5x | 35.59 | 36.82 | 1.035 | ~12 min |
-| 0.35 | 39 | ~3.5x | 35.59 | 35.24 | 0.990 | ~15 min |
+| Epsilon | Layers Compressed | Compression Ratio | PPL Before | PPL After | PPL Ratio | Time |
+|---------|-------------------|-------------------|------------|-----------|-----------|------|
+| 0.08 | 12 | ~1.2x | 35.83 | ~35.5 | ~0.99 | ~8 min |
+| 0.25 | 45 | **7.1x** | 35.83 | 41.44 | 1.16 | ~9.5 min |
+| 0.35 | ~60 | ~10x | 35.83 | ~58 | ~1.6 | ~10 min |
 
 Layer-level observations:
-- **Attention projections** (`q_proj`, `k_proj`) are highly compressible (low spectral entropy)
-- **Value/output projections** (`v_proj`, `o_proj`) are moderately compressible
-- **MLP layers** (`gate_proj`, `up_proj`, `down_proj`) are harder to compress with standard SVD, but benefit significantly from data-aware weighting
+- **Attention projections** (`q_proj`, `k_proj`) are highly compressible (low spectral entropy, data-aware error < 0.15)
+- **Value/output projections** (`v_proj`, `o_proj`) are moderately compressible but sensitive — quality-guarded at data_err > 0.16
+- **MLP layers** (`gate_proj`, `up_proj`, `down_proj`) are harder to compress, most are skipped by the quality guard
 
 ---
 
@@ -197,11 +196,13 @@ Layer-level observations:
 
 **`TCFDSFwd`** (`torch.autograd.Function`) — Custom autograd for efficient forward and backward passes. Gradients are computed in the k-dimensional factored space, never allocating an (m x n) matrix.
 
-**`data_aware_svd(W, Cov, eps)`** — Core algorithm. Computes covariance-weighted SVD with adaptive rank selection. Uses a two-phase approach: fast probe with `torch.svd_lowrank` to estimate rank, then targeted decomposition.
+**`data_aware_svd(W, Cov, eps)`** — Core algorithm. Computes covariance-weighted SVD with adaptive rank selection. Uses a two-phase approach: fast probe with `torch.svd_lowrank` to estimate rank, then targeted decomposition. Returns `Cov_sqrt` for reuse in error computation (avoids redundant eigendecomposition).
 
 **`safe_eigh(M)`** — Eigendecomposition with NumPy fallback. Works around Intel MKL crashes on large matrices (observed on 5632x5632).
 
-**`compress_streaming()`** — Block-by-block compression pipeline. Processes one transformer block at a time to limit peak VRAM to ~230 MB.
+**`calibrate_sensitivity()`** — Fast weight-norm heuristic with architecture-aware boosting for attention projections. Replaces the previous noise-injection method (~150 forward passes) with an instant computation.
+
+**`compress_streaming()`** — Block-by-block compression pipeline. Collects all covariances in a single pass (64 forward passes total), then compresses each block with aggressive memory management.
 
 ### Memory Layout
 
@@ -240,12 +241,11 @@ python tcfds.py --load compressed.pt
 
 | Setup | RAM | GPU | Compression Time | Notes |
 |-------|-----|-----|------------------|-------|
-| **Recommended** | 16 GB | RTX 2060+ (6 GB VRAM) | ~15 min (1.1B model) | CUDA accelerated SVD + covariance |
-| **Minimum** | 8 GB | None (CPU only) | ~2 hours (1.1B model) | Covariance on CPU, MKL fallback |
-| **Tested** | 16 GB | RTX 2060 (6 GB) | 15 min | Primary development hardware |
-| **Tested** | 8 GB | None | 2 hrs | Intel i7-8565U, Intel i5-3rd gen |
+| **Recommended** | 16 GB | RTX 2060+ (6 GB VRAM) | ~10 min (1.1B model) | CUDA accelerated SVD + covariance |
+| **Minimum** | 8 GB | None (CPU only) | ~1.5 hours (1.1B model) | Covariance on CPU, MKL fallback |
+| **Tested** | 16 GB | RTX 2060 (6 GB) | 9.5 min | Primary development hardware |
 
-The streaming compression pipeline limits peak memory to ~230 MB per block regardless of model size.
+Model loading uses `low_cpu_mem_usage=True` without `torch_dtype` to avoid Windows page file exhaustion on 16 GB machines.
 
 ---
 

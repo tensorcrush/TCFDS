@@ -111,33 +111,50 @@ def _do_svd(W, eps, total_energy, force_cpu=False):
     if reached.any():
         k = max(int(reached.float().argmax().item()) + 1, min_rank)
     else:
-        # Probe didn't reach threshold — full SVD needed
+        # Probe didn't reach threshold — extrapolate rank from energy curve
+        # instead of falling through to expensive full SVD
+        captured = ecum[-1].item() if len(ecum) > 0 else 0.0
+        if captured > 0.01:
+            # Estimate total rank needed by linear extrapolation
+            k_est = int(probe_k * threshold / max(captured, 0.01))
+            k_est = min(k_est, min(m, n))
+            k_est = max(k_est, min_rank)
+        else:
+            k_est = min(m, n)
         del U_p, S_p, V_p
         free_mem()
-        U_f, S_f, Vh_f = torch.linalg.svd(W, full_matrices=False)
-        ecum_f = (S_f**2).cumsum(0) / total_energy
-        reached_f = (ecum_f >= threshold)
-        k = int(reached_f.float().argmax().item()) + 1 if reached_f.any() else min(m, n)
-        k = max(k, min_rank)
-        U_out = U_f[:, :k].to(device)
-        S_out = S_f[:k].to(device)
-        Vh_out = Vh_f[:k].to(device)
-        del U_f, S_f, Vh_f
+        # Use extended svd_lowrank instead of full SVD (much faster)
+        q_ext = min(k_est + 32, min(m, n))
+        U, S, V = torch.svd_lowrank(W, q=q_ext, niter=3)
+        ecum2 = (S**2).cumsum(0) / total_energy
+        reached2 = (ecum2 >= threshold)
+        if reached2.any():
+            k = max(int(reached2.float().argmax().item()) + 1, min_rank)
+        else:
+            k = max(q_ext, min_rank)
+        k = min(k, q_ext)
+        U_out = U[:, :k].to(device)
+        S_out = S[:k].to(device)
+        Vh_out = V[:, :k].t().to(device)
+        del U, S, V
         return U_out, S_out, Vh_out, k
 
     del U_p, S_p, V_p
     q = min(k + 20, min(m, n))
-    U, S, V = torch.svd_lowrank(W, q=q, niter=5)
+    U, S, V = torch.svd_lowrank(W, q=q, niter=3)
     U_out = U[:, :k].to(device)
     S_out = S[:k].to(device)
-    Vh_out = V[:, :k].t().to(device)  # V from svd_lowrank is n x q, we want k x n
+    Vh_out = V[:, :k].t().to(device)
     del U, S, V
     return U_out, S_out, Vh_out, k
 
 def data_aware_svd(W, Cov, eps):
-    """Covariance-weighted SVD. Forces CPU for large matrices."""
+    """Covariance-weighted SVD. Forces CPU for large matrices.
+    Returns (U, S, Vh, k, Cov_sqrt) — Cov_sqrt is returned so callers
+    can compute the data-aware error without a second eigendecomposition."""
     m, n = W.shape
-    force_cpu = (n > CPU_SVD_THRESHOLD)
+    # svd_lowrank is iterative and GPU-safe; only force CPU for eigh (done in safe_eigh)
+    force_cpu = False
 
     # Eigendecomposition of covariance (always safe)
     eigvals, eigvecs = safe_eigh(Cov)
@@ -147,7 +164,8 @@ def data_aware_svd(W, Cov, eps):
     if torch.isnan(eigvals).any() or torch.isinf(eigvals).any():
         log(f"    WARNING: NaN/Inf in covariance eigenvalues, falling back to standard SVD")
         del eigvals, eigvecs
-        return standard_svd(W, eps)
+        U, S, Vh, k = standard_svd(W, eps)
+        return U, S, Vh, k, None
 
     sqrt_ev = eigvals.sqrt()
     inv_sqrt_ev = 1.0 / sqrt_ev
@@ -170,7 +188,8 @@ def data_aware_svd(W, Cov, eps):
     if total_energy < 1e-12:
         log(f"    WARNING: near-zero energy in weighted matrix, falling back to standard SVD")
         del Cov_sqrt, Cov_sqrt_inv, W_weighted
-        return standard_svd(W, eps)
+        U, S, Vh, k = standard_svd(W, eps)
+        return U, S, Vh, k, None
 
     # SVD on weighted matrix (on compute_device, which may be CPU)
     U, S, Vh, k = _do_svd(W_weighted, eps, total_energy, force_cpu=False)
@@ -180,17 +199,18 @@ def data_aware_svd(W, Cov, eps):
 
     # Transform V back from covariance-weighted space
     Vh_orig = Vh @ Cov_sqrt_inv.to(Vh.device)
-    del Cov_sqrt, Cov_sqrt_inv, Vh
+    del Cov_sqrt_inv, Vh
     free_mem()
 
-    return U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k
+    # Return Cov_sqrt for reuse in error computation (avoids second eigh)
+    return U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k, Cov_sqrt.to(W.device)
 
 def standard_svd(W, eps):
     """Standard SVD without data-aware weighting."""
     m, n = W.shape
-    force_cpu = (max(m, n) > CPU_SVD_THRESHOLD)
+    # svd_lowrank is iterative and GPU-safe; no need to force CPU
     total_energy = (W**2).sum().item()
-    U, S, Vh, k = _do_svd(W, eps, total_energy, force_cpu=force_cpu)
+    U, S, Vh, k = _do_svd(W, eps, total_energy, force_cpu=False)
     return U, S, Vh, k
 
 class TCFDSLinear(nn.Module):
@@ -206,26 +226,24 @@ class TCFDSLinear(nn.Module):
     @classmethod
     def from_weight(cls, W_f32, bias_f32, eps, store_dtype, Cov=None):
         m, n = W_f32.shape
+        Cov_sqrt = None
         if Cov is not None:
-            U, S, Vh, k = data_aware_svd(W_f32, Cov, eps)
+            U, S, Vh, k, Cov_sqrt = data_aware_svd(W_f32, Cov, eps)
         else:
             U, S, Vh, k = standard_svd(W_f32, eps)
 
-        # Compute approximation error
+        # Compute approximation errors
         W_approx = (U * S.unsqueeze(0)) @ Vh
         diff = W_f32 - W_approx
         w_norm = W_f32.norm().item()
         rel_err = diff.norm().item() / max(w_norm, 1e-12)
         data_err = rel_err
 
-        if Cov is not None:
-            ev, evec = safe_eigh(Cov)
-            ev = ev.clamp(min=1e-8)
-            Cs = (evec * ev.sqrt().unsqueeze(0)) @ evec.t()
-            data_err = (diff @ Cs).norm().item() / max((W_f32 @ Cs).norm().item(), 1e-12)
-            del ev, evec, Cs
+        if Cov_sqrt is not None:
+            # Reuse Cov_sqrt from data_aware_svd (no second eigendecomposition)
+            data_err = (diff @ Cov_sqrt).norm().item() / max((W_f32 @ Cov_sqrt).norm().item(), 1e-12)
 
-        del W_approx, diff
+        del W_approx, diff, Cov_sqrt
 
         orig_p = m * n + (m if bias_f32 is not None else 0)
         comp_p = k * (m + n) + k + (m if bias_f32 is not None else 0)
@@ -386,39 +404,42 @@ def collect_covs_for_layers(model, tokenizer, layer_names, seq_len=64):
     return covs
 
 def calibrate_sensitivity(model, tokenizer, ref_text):
-    """Measure per-layer sensitivity by noise injection."""
-    log("  Calibrating layer sensitivity...")
-    dev = next(model.parameters()).device
-    ids = tokenizer(ref_text, return_tensors="pt")
-    ids = {k: v.to(dev) for k, v in ids.items()}
-    with torch.no_grad():
-        base_loss = model(**ids, labels=ids["input_ids"]).loss.item()
-
+    """Fast sensitivity estimation using weight-norm heuristic.
+    Attention projections (q/k) get higher sensitivity than MLP layers.
+    This avoids ~150 forward passes of the noise-injection method."""
+    log("  Estimating layer sensitivity (weight-norm heuristic)...")
     sens = {}
-    for name, mod in list(model.named_modules()):
+    norms = {}
+    for name, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
         if min(mod.out_features, mod.in_features) < 256:
             continue
         if any(p in name.lower() for p in ('embed', 'norm', 'lm_head')):
             continue
-        orig_w = mod.weight.data.clone()
-        noise = 0.01 * orig_w.norm() * torch.randn_like(orig_w) / math.sqrt(orig_w.numel())
-        mod.weight.data += noise
-        with torch.no_grad():
-            try:
-                nl = model(**ids, labels=ids["input_ids"]).loss.item()
-            except RuntimeError:
-                nl = base_loss
-        mod.weight.data = orig_w
-        del orig_w, noise
-        sens[name] = abs(nl - base_loss) / 0.01
+        # Normalized weight norm: ||W||_F / sqrt(m*n)
+        w = mod.weight.data.float()
+        norms[name] = w.norm().item() / math.sqrt(w.numel())
 
-    if sens:
-        mx = max(sens.values())
-        if mx > 0:
-            sens = {k: v / mx for k, v in sens.items()}
-    log(f"  Calibrated {len(sens)} layers")
+    if not norms:
+        return sens
+
+    mx = max(norms.values())
+    for name, nv in norms.items():
+        # Base sensitivity from weight norm (higher norm = more sensitive)
+        s = nv / max(mx, 1e-12)
+        # Boost attention projections (empirically more sensitive)
+        low = name.lower()
+        if 'q_proj' in low or 'k_proj' in low:
+            s = min(s * 1.5, 1.0)
+        elif 'v_proj' in low or 'o_proj' in low:
+            s = min(s * 1.2, 1.0)
+        # MLP layers are typically more robust
+        elif 'gate_proj' in low or 'up_proj' in low or 'down_proj' in low:
+            s = s * 0.8
+        sens[name] = s
+
+    log(f"  Estimated sensitivity for {len(sens)} layers")
     return sens
 
 # === SURGERY ===
@@ -460,15 +481,17 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
     results, tot_orig, tot_comp, layer_idx = [], 0, 0, 0
     t0 = time.time()
 
+    # Collect ALL covariances in a single pass (64 forward passes total,
+    # not 64 * num_blocks). This is the single biggest speedup.
+    all_layer_names = [n for _, layers in block_groups for n, _ in layers]
+    log(f"  Collecting covariances for {len(all_layer_names)} layers (single pass)...")
+    all_covs = collect_covs_for_layers(model, tokenizer, all_layer_names)
+    cov_mb = sum(c.numel() * 4 / 1e6 for c in all_covs.values())
+    log(f"  Covariances: {len(all_covs)}/{len(all_layer_names)} ({cov_mb:.0f} MB)")
+
     for block_name, layers in block_groups:
         layer_names = [n for n, _ in layers]
         log(f"\n  --- {block_name} ({len(layers)} layers) ---")
-
-        # Collect covariances for this block
-        covs = collect_covs_for_layers(model, tokenizer, layer_names)
-        n_cov = sum(1 for n in layer_names if n in covs)
-        cov_mb = sum(c.numel() * 4 / 1e6 for c in covs.values())
-        log(f"  Covariances: {n_cov}/{len(layers)} ({cov_mb:.0f} MB)")
 
         for name, mod in layers:
             m, n = mod.out_features, mod.in_features
@@ -482,10 +505,10 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
                 aeps = base_eps * (0.3 + 1.7 * (1.0 - s))
                 aeps = max(0.02, min(aeps, base_eps * 1.5))
 
-                # Extract weight to CPU for SVD
+                # Extract weight in float32 for SVD
                 w32 = mod.weight.data.float().cpu()
                 b32 = mod.bias.data.float().cpu() if mod.bias is not None else None
-                cov = covs.get(name, None)
+                cov = all_covs.get(name, None)
 
                 t1 = time.time()
                 tcfds = TCFDSLinear.from_weight(w32, b32, aeps, store_dtype, Cov=cov)
@@ -497,8 +520,11 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
                     del tcfds
                     continue
 
-                if tcfds.rel_err > 0.5:
-                    log(f"  [{layer_idx}/{total_layers}] {name:<38} SKIP (frob_err {tcfds.rel_err:.3f} > 0.5)")
+                # Quality guard: use data-aware error (measures actual impact on
+                # model outputs) when available, Frobenius error otherwise
+                err = tcfds.data_err if (cov is not None and tcfds.data_err != tcfds.rel_err) else tcfds.rel_err
+                if err > 0.16:
+                    log(f"  [{layer_idx}/{total_layers}] {name:<38} SKIP (err {err:.3f} > 0.16)")
                     del tcfds
                     continue
 
@@ -528,10 +554,10 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
                 log(f"  [{layer_idx}/{total_layers}] SKIP {name}: {e}")
                 traceback.print_exc()
 
-        # Free block covariances
-        del covs
         free_mem()
 
+    del all_covs
+    free_mem()
     elapsed = time.time() - t0
     log(f"\n  Done: {len(results)}/{total_layers} layers in {elapsed:.0f}s ({elapsed/60:.1f}min)")
     return results, tot_orig, tot_comp
