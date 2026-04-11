@@ -719,7 +719,7 @@ def main():
     log(f"  Loading in {a.dtype}...")
     model = AutoModelForCausalLM.from_pretrained(
         a.model, trust_remote_code=True, low_cpu_mem_usage=True,
-        torch_dtype=load_dtype
+        dtype=load_dtype
     )
     model.eval()
     model = model.to(DEVICE)
