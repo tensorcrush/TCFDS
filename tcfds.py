@@ -747,7 +747,8 @@ def main():
                 break
             if not u or u.lower() in ('quit', 'exit', 'q'):
                 break
-            pr = f"<|user|>\n{u}</s>\n<|assistant|>\n" if "chat" in a.model.lower() else u
+            model_name_for_chat = meta.get('model_name', a.model)
+            pr = f"<|user|>\n{u}</s>\n<|assistant|>\n" if "chat" in model_name_for_chat.lower() else u
             try:
                 print(f"AI: {gen(model, tok, pr, 150)[len(pr):].strip()}\n")
             except Exception as e:
