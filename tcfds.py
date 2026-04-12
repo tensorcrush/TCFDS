@@ -660,7 +660,7 @@ def verify(model, store_dtype=None):
     for li in r["layers"][:5]:
         mod = dict(model.named_modules())[li["name"]]
         S = mod.S.detach().float()
-        sv_checks.append(round((S[0] / S[-1]).item(), 1) if S.numel() > 1 else 0.0)
+        sv_checks.append(round((S[0] / max(S[-1].abs().item(), 1e-10)), 1) if S.numel() > 1 else 0.0)
     c3 = len(sv_checks) > 0 and all(s > 1.0 for s in sv_checks)
     sav = (tot_o - tot_c) * bpe / 1e6
 
