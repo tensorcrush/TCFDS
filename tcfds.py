@@ -487,7 +487,7 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
 
                 # Epsilon scheduling: tighter eps for first/last 2 blocks
                 # (these layers are empirically the most sensitive)
-                n_blocks = len(block_groups)
+                n_blocks = sum(1 for bname, _ in block_groups if bname.startswith("block_"))
                 m_block = re.search(r'\.layers\.(\d+)\.', name)
                 if m_block:
                     blk_idx = int(m_block.group(1))
