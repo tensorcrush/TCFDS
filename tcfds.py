@@ -299,8 +299,9 @@ def _load_calibration_texts(tokenizer, n_samples=32, seq_len=256):
         tokens = tokenizer(all_text, return_tensors="pt", truncation=False)["input_ids"][0]
         chunks = []
         for i in range(0, len(tokens) - seq_len, seq_len):
-            chunk_ids = tokens[i:i + seq_len]
-            chunks.append(tokenizer.decode(chunk_ids, skip_special_tokens=True))
+            # Return raw token-id tensors — avoids a decode+re-encode round-trip
+            # inside collect_covs_for_layers.
+            chunks.append(tokens[i:i + seq_len])
             if len(chunks) >= n_samples:
                 break
         if len(chunks) >= n_samples // 2:
@@ -324,13 +325,20 @@ def collect_covs_for_layers(model, tokenizer, layer_names, calib_texts=None, seq
     target = set(layer_names)
     dev = next(model.parameters()).device
 
+    # Pre-allocate covariance matrices to avoid per-sample conditional allocation
+    # and to let the hook skip the `if name not in covs` branch entirely.
+    for name, mod in model.named_modules():
+        if name in target and isinstance(mod, nn.Linear):
+            n = mod.in_features
+            covs[name] = torch.zeros(n, n)
+            tcounts[name] = 0
+
     def make_hook(name):
         def fn(mod, inp, out):
             x = inp[0].detach().float().cpu().reshape(-1, inp[0].shape[-1])
-            if name not in covs:
-                covs[name] = torch.zeros(x.shape[1], x.shape[1])
-                tcounts[name] = 0
-            covs[name] += x.t() @ x
+            # torch.addmm(input, mat1, mat2, out=input) avoids allocating a
+            # temporary (n x n) matrix for the intermediate x.T @ x product.
+            torch.addmm(covs[name], x.t(), x, out=covs[name])
             tcounts[name] += x.shape[0]
         return fn
 
@@ -341,9 +349,17 @@ def collect_covs_for_layers(model, tokenizer, layer_names, calib_texts=None, seq
     model.eval()
     n_errors = 0
     with torch.no_grad():
-        for i, text in enumerate(calib_texts):
-            ids = tokenizer(text, return_tensors="pt", truncation=True, max_length=seq_len)
-            ids = {k: v.to(dev) for k, v in ids.items()}
+        for i, item in enumerate(calib_texts):
+            if isinstance(item, torch.Tensor):
+                # Pre-tokenized path: item is a 1-D token-id tensor from
+                # _load_calibration_texts — no decode/re-encode needed.
+                input_ids = item.unsqueeze(0).to(dev)
+                ids = {"input_ids": input_ids,
+                       "attention_mask": torch.ones_like(input_ids)}
+            else:
+                ids = tokenizer(item, return_tensors="pt", truncation=True,
+                                max_length=seq_len)
+                ids = {k: v.to(dev) for k, v in ids.items()}
             try:
                 model(**ids)
             except RuntimeError as e:
@@ -469,6 +485,10 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
     cov_mb = sum(c.numel() * 4 / 1e6 for c in all_covs.values())
     log(f"  Covariances: {len(all_covs)}/{len(all_layer_names)} ({cov_mb:.0f} MB)")
 
+    # Cache values that are constant across the entire compression loop.
+    n_blocks = sum(1 for bname, _ in block_groups if bname.startswith("block_"))
+    model_dev = next(model.parameters()).device
+
     for block_name, layers in block_groups:
         layer_names = [n for n, _ in layers]
         log(f"\n  --- {block_name} ({len(layers)} layers) ---")
@@ -487,7 +507,6 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
 
                 # Epsilon scheduling: tighter eps for first/last 2 blocks
                 # (these layers are empirically the most sensitive)
-                n_blocks = sum(1 for bname, _ in block_groups if bname.startswith("block_"))
                 m_block = re.search(r'\.layers\.(\d+)\.', name)
                 if m_block:
                     blk_idx = int(m_block.group(1))
@@ -541,7 +560,7 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
                 orig_p = m * n + (m if mod.bias is not None else 0)
                 tot_orig += orig_p
                 tot_comp += tcfds.param_count()
-                tcfds = tcfds.to(next(model.parameters()).device)
+                tcfds = tcfds.to(model_dev)
                 set_mod(model, name, tcfds)
 
                 results.append({
@@ -658,8 +677,9 @@ def verify(model, store_dtype=None):
     c1 = nt > 0 and not any(l["full_mat"] for l in r["layers"])
     c2 = tot_c < tot_o if nt > 0 else False
     sv_checks = []
+    named_mods = dict(model.named_modules())
     for li in r["layers"][:5]:
-        mod = dict(model.named_modules())[li["name"]]
+        mod = named_mods[li["name"]]
         S = mod.S.detach().float()
         sv_checks.append(round((S[0] / max(S[-1].abs().item(), 1e-10)), 1) if S.numel() > 1 else 0.0)
     c3 = len(sv_checks) > 0 and all(s > 1.0 for s in sv_checks)
@@ -740,6 +760,8 @@ def main():
             rpt = verify(model)
             print(f"  {rpt['n_tcfds']} layers, {rpt['checks']['ratio']:.1f}x, {rpt['verdict']}")
         print(f"\nChat (type 'quit' to exit)\n")
+        model_name_for_chat = meta.get('model_name', a.model)
+        use_chat_fmt = "chat" in model_name_for_chat.lower()
         while True:
             try:
                 u = input("You: ").strip()
@@ -747,8 +769,7 @@ def main():
                 break
             if not u or u.lower() in ('quit', 'exit', 'q'):
                 break
-            model_name_for_chat = meta.get('model_name', a.model)
-            pr = f"<|user|>\n{u}</s>\n<|assistant|>\n" if "chat" in model_name_for_chat.lower() else u
+            pr = f"<|user|>\n{u}</s>\n<|assistant|>\n" if use_chat_fmt else u
             try:
                 print(f"AI: {gen(model, tok, pr, 150)[len(pr):].strip()}\n")
             except Exception as e:
