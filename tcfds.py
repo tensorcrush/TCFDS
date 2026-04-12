@@ -293,7 +293,8 @@ def _load_calibration_texts(tokenizer, n_samples=32, seq_len=256):
         log(f"  Loading WikiText-2 ({n_samples} x {seq_len} tokens)...")
         ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
         # Concatenate all text, then chunk into seq_len-token pieces
-        all_text = "\n".join(t for t in ds["text"] if len(t.strip()) > 50)
+        texts = [t for t in ds["text"] if len(t.strip()) > 50]
+        all_text = "\n".join(texts[:5000])  # cap at ~5 000 paragraphs to avoid OOM
         # Tokenize once to find chunk boundaries
         tokens = tokenizer(all_text, return_tensors="pt", truncation=False)["input_ids"][0]
         chunks = []
