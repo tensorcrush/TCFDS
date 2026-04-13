@@ -560,7 +560,7 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
                 orig_p = m * n + (m if mod.bias is not None else 0)
                 tot_orig += orig_p
                 tot_comp += tcfds.param_count()
-                tcfds = tcfds.to(model_dev)
+                tcfds = tcfds.to(mod.weight.device)
                 set_mod(model, name, tcfds)
 
                 results.append({
@@ -874,15 +874,12 @@ def main():
     # [5] Compressed gen
     log("\n[5/6] Compressed generation...")
     try:
-            try:
-                cppl = ppl(model, tok, ref)
-                
+        cppl = ppl(model, tok, ref)
+        log(f"  PPL: {bppl:.2f} -> {cppl:.2f} ({cppl/bppl:.3f}x)")
     except Exception as e:
         log(f"  Step 5 skipped: {e}")
-
-    f"  PPL: {bppl:.2f} -> {cppl:.2f} ({cppl/bppl:.3f}x)")
-    except Exception:
         cppl = float('inf')
+
     for p in prompts:
         try:
             t = gen(model, tok, p, 60)
