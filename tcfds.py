@@ -1,10 +1,12 @@
 """
-TCFDS v6.3.1 - Data-Aware Compression + Adaptive Epsilon + GPU Support
+TCFDS v6.4.0 - Data-Aware Compression + Adaptive Epsilon + GPU Support
 =====================================================================
-Fixes vs v6.3:
+Fixes vs v6.4.0:
+  - Add auto-detection of chat formats for all major LLM families
+  - Supports Gemma, LLaMA 3, Qwen, Mistral, Mixtral, Phi, TinyLlama, StableLM
   - Fix TCFDSFwd.backward: grad_U = z.t() @ g (was g.t() @ (z*S.softmax)), grad_V fixed
   - Fix torch.load weights_only=False in load_compressed
-  - Bump to v6.3.1
+  - Bump to v6.4.0
 
 Usage:
   python tcfds.py --eps 0.25 --save compressed.pt
@@ -39,6 +41,127 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Threshold above which SVD/eigh operations are forced to CPU to avoid GPU segfaults
 CPU_SVD_THRESHOLD = 2048
+
+# =============================================================================
+# CHAT FORMAT AUTO-DETECTION SYSTEM v1.0
+# Detects model type and returns the appropriate chat template format.
+# Returns a dict with 'user', 'model', 'system', 'prefix', 'suffix' keys,
+# or None for raw text mode.
+# =============================================================================
+
+def detect_chat_format(model_name):
+    n = model_name.lower()
+
+    if 'gemma' in n:
+        # Gemma 4+: <|turn>user\n{prompt}\n<|turn>model\n
+        return {
+            'type': 'gemma',
+            'user': '<|turn>user\n',
+            'model': '<|turn>model\n',
+            'system': '<|turn>system\n',
+            'prefix': '',
+            'suffix': '<|turn|>',
+            'requires_generation_marker': True,
+        }
+    elif 'llama-3' in n or 'llama3' in n or 'meta-llama/llama-3' in n:
+        # LLaMA 3+: <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+        return {
+            'type': 'llama3',
+            'user': '<|start_header_id|>user<|end_header_id|>\n\n',
+            'model': '<|start_header_id|>assistant<|end_header_id|>\n\n',
+            'system': '<|start_header_id|>system<|end_header_id|>\n\n',
+            'prefix': '<|begin_of_text|>',
+            'suffix': '<|eot_id|>',
+            'requires_generation_marker': True,
+        }
+    elif 'qwen' in n:
+        # Qwen: <|im_start|>user\n{prompt}\n<|im_end|>\n<|im_start|>assistant\n
+        return {
+            'type': 'qwen',
+            'user': '<|im_start|>user\n',
+            'model': '<|im_start|>assistant\n',
+            'system': '<|im_start|>system\n',
+            'prefix': '',
+            'suffix': '<|im_end|>',
+            'requires_generation_marker': True,
+        }
+    elif 'mistral' in n or 'mixtral' in n:
+        # Mistral/Mixtral: [INST] {prompt} [/INST] [/ASSISTANT]
+        return {
+            'type': 'mistral',
+            'user': '[INST] ',
+            'model': '[/INST] ',
+            'system': '',
+            'prefix': '',
+            'suffix': ' [/ASSISTANT]',
+            'requires_generation_marker': False,
+        }
+    elif 'phi' in n and 'chat' in n:
+        # Phi-3/4 chat: <|user|>\n{prompt}\n<|assistant|>\n
+        return {
+            'type': 'phi',
+            'user': '<|user|>\n',
+            'model': '<|assistant|>\n',
+            'system': '',
+            'prefix': '',
+            'suffix': '<|end|>',
+            'requires_generation_marker': True,
+        }
+    elif 'tinyllama' in n or 'chat' in n:
+        # TinyLlama / generic ChatML: <|user|>\n{prompt}\n</s>\n<|assistant|>\n
+        return {
+            'type': 'chatml',
+            'user': '<|user|>\n',
+            'model': '<|assistant|>\n',
+            'system': '',
+            'prefix': '',
+            'suffix': '</s>',
+            'requires_generation_marker': True,
+        }
+    elif 'stablelm' in n:
+        return {
+            'type': 'stablelm',
+            'user': '<|user|>',
+            'model': '<|assistant|>',
+            'system': '',
+            'prefix': '',
+            'suffix': '<|endoftext|>',
+            'requires_generation_marker': True,
+        }
+    else:
+        # Unknown model — raw text mode
+        return None
+
+
+def format_prompt_for_chat(prompt, fmt):
+    if fmt is None:
+        return prompt  # raw text mode
+    # Build: prefix + user_turn + prompt + model_turn (generation marker)
+    user_part = fmt['user'] + prompt
+    model_part = fmt['model'] if fmt['requires_generation_marker'] else ''
+    return fmt['prefix'] + user_part + model_part
+
+
+def format_ref_for_ppl(ref_text, fmt):
+    """Format reference text for PPL evaluation — wraps in appropriate chat template."""
+    if fmt is None:
+        return ref_text
+    if fmt['type'] == 'gemma':
+        return '<|turn>user\n' + ref_text + '\n<|turn>model\n'
+    elif fmt['type'] == 'llama3':
+        return '<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n' + ref_text + '<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
+    elif fmt['type'] == 'qwen':
+        return '<|im_start|>user\n' + ref_text + '\n<|im_start|>assistant\n'
+    elif fmt['type'] == 'mistral':
+        return '[INST] ' + ref_text + ' [/INST] '
+    elif fmt['type'] == 'chatml':
+        return '<|user|>\n' + ref_text + '</s>\n<|assistant|>\n'
+    elif fmt['type'] == 'phi':
+        return '<|user|>\n' + ref_text + '<|assistant|>\n'
+    elif fmt['type'] == 'stablelm':
+        return '<|user|>' + ref_text + '<|assistant|>'
+    else:
+        return ref_text
 
 def log(msg):
     v = f" VRAM={vram_mb():.0f}MB" if torch.cuda.is_available() else ""
@@ -631,7 +754,7 @@ def save_compressed(model, results, meta, path):
         'results': results,
         'meta': meta,
         'tcfds_layers': {},
-        'version': 'v6.3.1'
+        'version': 'v6.4.0'
     }
     for name, mod in model.named_modules():
         if type(mod).__name__ == 'TCFDSLinear':
@@ -724,7 +847,7 @@ def verify(model, store_dtype=None):
     r["verdict"] = "VERIFIED" if (c1 and c2 and c3) else "FAILED"
     return r
 
-def gen(model, tok, prompt, max_new=80):
+def gen(model, tok, prompt, max_new=80, fmt=None, original_prompt=None):
     ids = tok(prompt, return_tensors="pt")
     dev = next(model.parameters()).device
     ids = {k: v.to(dev) for k, v in ids.items()}
@@ -735,7 +858,18 @@ def gen(model, tok, prompt, max_new=80):
             top_k=40, top_p=0.9, pad_token_id=tok.eos_token_id,
             repetition_penalty=1.2
         )
-    return tok.decode(out[0], skip_special_tokens=True)
+    result = tok.decode(out[0], skip_special_tokens=True)
+    # If chat format provided, strip the model's turn prefix from output
+    if fmt is not None and fmt['requires_generation_marker']:
+        marker = fmt['model']
+        if result.startswith(marker):
+            result = result[len(marker):]
+        # Also handle case where result contains original_prompt
+        if original_prompt is not None:
+            idx = result.find(original_prompt)
+            if idx >= 0:
+                result = result[idx + len(original_prompt):]
+    return result
 
 def ppl(model, tok, text):
     ids = tok(text, return_tensors="pt")
@@ -748,7 +882,7 @@ def ppl(model, tok, text):
 # === MAIN ===
 
 def main():
-    pa = argparse.ArgumentParser(description="TCFDS v6.3.1 - Data-Aware LLM Compression")
+    pa = argparse.ArgumentParser(description="TCFDS v6.4.0 - Data-Aware LLM Compression")
     pa.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                     help="HuggingFace model ID or local path")
     pa.add_argument("--eps", type=float, default=0.25,
@@ -768,7 +902,7 @@ def main():
     load_dtype = dtype_map[a.dtype]
 
     print("=" * 65)
-    print(f"  TCFDS v6.3.1 (Data-Aware + GPU + Memory Safety) | eps={a.eps}")
+    print(f"  TCFDS v6.4.0 (Data-Aware + GPU + Memory Safety) | eps={a.eps}")
     print(f"  Device: {DEVICE}")
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
@@ -790,7 +924,9 @@ def main():
             print(f"  {rpt['n_tcfds']} layers, {rpt['checks']['ratio']:.1f}x, {rpt['verdict']}")
         print(f"\nChat (type 'quit' to exit)\n")
         model_name_for_chat = meta.get('model_name', a.model)
-        use_chat_fmt = "chat" in model_name_for_chat.lower()
+        chat_fmt = detect_chat_format(model_name_for_chat)
+        if chat_fmt:
+            print(f"  Detected format: {chat_fmt['type']}")
         while True:
             try:
                 u = input("You: ").strip()
@@ -798,9 +934,13 @@ def main():
                 break
             if not u or u.lower() in ('quit', 'exit', 'q'):
                 break
-            pr = f"<|user|>\n{u}</s>\n<|assistant|>\n" if use_chat_fmt else u
+            pr = format_prompt_for_chat(u, chat_fmt)
             try:
-                print(f"AI: {gen(model, tok, pr, 150)[len(pr):].strip()}\n")
+                if chat_fmt is None:
+                    output = gen(model, tok, pr, 150)[len(pr):].strip()
+                else:
+                    output = gen(model, tok, pr, 150, fmt=chat_fmt, original_prompt=u).strip()
+                print(f"AI: {output}\n")
             except Exception as e:
                 print(f"Error: {e}\n")
         return
@@ -856,6 +996,9 @@ def main():
 
     # [2] Baseline
     log("\n[2/6] Baseline...")
+    chat_fmt = detect_chat_format(a.model)
+    if chat_fmt:
+        log(f"  Detected format: {chat_fmt['type']}")
     prompts = [
         "The key insight behind neural networks is",
         "In mathematics, a manifold is",
@@ -864,16 +1007,18 @@ def main():
     ref = ("The Transformer uses self-attention to process sequences in parallel. "
            "Each layer computes attention weights so tokens attend to each other, "
            "capturing complex long-range dependencies efficiently.")
+    ref_for_ppl = format_ref_for_ppl(ref, chat_fmt)
     try:
-        bppl = ppl(model, tok, ref)
+        bppl = ppl(model, tok, ref_for_ppl)
         log(f"  PPL: {bppl:.2f}")
     except Exception:
         bppl = float('inf')
     for p in prompts:
         try:
-            t = gen(model, tok, p, 60)
+            fp = format_prompt_for_chat(p, chat_fmt)
+            t = gen(model, tok, fp, 60, fmt=chat_fmt, original_prompt=p)
             print(f'  "{p}"')
-            print(f"    -> {t[len(p):len(p)+120]}")
+            print(f"    -> {t[:120]}")
         except Exception as e:
             print(f"  ERR: {e}")
 
@@ -902,8 +1047,9 @@ def main():
 
     # [5] Compressed gen
     log("\n[5/6] Compressed generation...")
+    ref_for_cppl = format_ref_for_ppl(ref, chat_fmt)
     try:
-        cppl = ppl(model, tok, ref)
+        cppl = ppl(model, tok, ref_for_cppl)
         log(f"  PPL: {bppl:.2f} -> {cppl:.2f} ({cppl/bppl:.3f}x)")
     except Exception as e:
         log(f"  Step 5 skipped: {e}")
@@ -911,9 +1057,10 @@ def main():
 
     for p in prompts:
         try:
-            t = gen(model, tok, p, 60)
+            fp = format_prompt_for_chat(p, chat_fmt)
+            t = gen(model, tok, fp, 60, fmt=chat_fmt, original_prompt=p)
             print(f'  "{p}"')
-            print(f"    -> {t[len(p):len(p)+120]}")
+            print(f"    -> {t[:120]}")
         except Exception as e:
             print(f"  ERR: {e}")
 
@@ -922,7 +1069,7 @@ def main():
     if a.save:
         save_compressed(model, results, {
             'model_name': a.model, 'eps': a.eps,
-            'base_ppl': bppl, 'comp_ppl': cppl, 'version': 'v6.3.1'
+            'base_ppl': bppl, 'comp_ppl': cppl, 'version': 'v6.4.0'
         }, a.save)
 
     try:
@@ -938,7 +1085,7 @@ def main():
     rpt["base_ppl"] = round(bppl, 2) if bppl != float('inf') else None
     rpt["comp_ppl"] = round(cppl, 2) if cppl != float('inf') else None
     rpt["results"] = results
-    rpt["version"] = "v6.3.1"
+    rpt["version"] = "v6.4.0"
     ck = rpt["checks"]
     print(f"  CHECK 1 (modules replaced):  {'PASS' if ck['modules_replaced'] else 'FAIL'}")
     print(f"  CHECK 2 (memory reduced):    {'PASS' if ck['memory_reduced'] else 'FAIL'} "
@@ -951,7 +1098,7 @@ def main():
 
 
     print(f"\n{'='*65}")
-    print(f"  TCFDS v6.3.1 Results")
+    print(f"  TCFDS v6.4.0 Results")
     print(f"  Layers: {len(results)} ({n_attn} attn + {n_mlp} MLP) | "
           f"{ck['ratio']:.1f}x | {ck['savings_mb']:.1f}MB saved")
     if bppl != float('inf') and cppl != float('inf'):
@@ -965,6 +1112,9 @@ def main():
     print("=" * 65)
 
     print(f"\nChat (type 'quit' to exit)\n")
+    chat_fmt = detect_chat_format(a.model)
+    if chat_fmt:
+        print(f"  Detected format: {chat_fmt['type']}")
     while True:
         try:
             u = input("You: ").strip()
@@ -972,9 +1122,13 @@ def main():
             break
         if not u or u.lower() in ('quit', 'exit', 'q'):
             break
-        pr = f"<|user|>\n{u}</s>\n<|assistant|>\n" if "chat" in a.model.lower() else u
+        pr = format_prompt_for_chat(u, chat_fmt)
         try:
-            print(f"AI: {gen(model, tok, pr, 150)[len(pr):].strip()}\n")
+            if chat_fmt is None:
+                output = gen(model, tok, pr, 150)[len(pr):].strip()
+            else:
+                output = gen(model, tok, pr, 150, fmt=chat_fmt, original_prompt=u).strip()
+            print(f"AI: {output}\n")
         except Exception as e:
             print(f"Error: {e}\n")
     print("Done.")
