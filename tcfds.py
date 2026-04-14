@@ -62,6 +62,8 @@ def detect_chat_format(model_name):
             'prefix': '',
             'suffix': '<|turn|>',
             'requires_generation_marker': True,
+            'needs_system_message': False,
+            'msg_end': '',  # handled by role prefix
         }
     elif 'llama-3' in n or 'llama3' in n or 'meta-llama/llama-3' in n:
         # LLaMA 3+: <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
@@ -73,17 +75,23 @@ def detect_chat_format(model_name):
             'prefix': '<|begin_of_text|>',
             'suffix': '<|eot_id|>',
             'requires_generation_marker': True,
+            'needs_system_message': False,
+            'msg_end': '',
         }
     elif 'qwen' in n:
-        # Qwen: <|im_start|>user\n{prompt}\n<|im_end|>\n<|im_start|>assistant\n
+        # Qwen2.5: Each message is <|im_start|>{role}\n{content}<|im_end|>\n
+        # System required at start. User msg ends with <|im_end|>\n then assistant prompt.
         return {
             'type': 'qwen',
             'user': '<|im_start|>user\n',
             'model': '<|im_start|>assistant\n',
             'system': '<|im_start|>system\n',
             'prefix': '',
-            'suffix': '<|im_end|>',
+            'suffix': '<|im_end|>\n',
             'requires_generation_marker': True,
+            'needs_system_message': True,
+            'system_default': 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.',
+            'msg_end': '<|im_end|>\n',
         }
     elif 'mistral' in n or 'mixtral' in n:
         # Mistral/Mixtral: [INST] {prompt} [/INST] [/ASSISTANT]
@@ -134,32 +142,96 @@ def detect_chat_format(model_name):
 
 
 def format_prompt_for_chat(prompt, fmt):
+    """Build a properly formatted chat prompt from a user message.
+
+    Template structure varies by model:
+    - Qwen: <|im_start|>system\n{system_text}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+    - Gemma: <|turn>user\n{prompt}<|turn|>model\n
+    - LLaMA3: <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+    - ChatML: <|user|>\n{prompt}</s>\n<|assistant|>\n
+    """
     if fmt is None:
         return prompt  # raw text mode
-    # Build: prefix + user_turn + prompt + model_turn (generation marker)
-    user_part = fmt['user'] + prompt
-    model_part = fmt['model'] if fmt['requires_generation_marker'] else ''
-    return fmt['prefix'] + user_part + model_part
+
+    t = fmt['type']
+
+    if t == 'qwen':
+        # Qwen requires: system + user message (with <|im_end|>) + assistant prompt
+        system_text = fmt.get('system_default', 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.')
+        msg_end = fmt.get('msg_end', '<|im_end|>\n')
+        result = (fmt['prefix'] +
+                  fmt['system'] + system_text + '<|im_end|>\n' +
+                  fmt['user'] + prompt + msg_end +
+                  fmt['model'])
+        return result
+
+    elif t == 'gemma':
+        # Gemma: user turn + model generation marker
+        return (fmt['prefix'] +
+                fmt['user'] + prompt +
+                fmt['model'])
+
+    elif t == 'llama3':
+        # LLaMA 3: full structure with prefix, user turn, eot, assistant turn
+        return (fmt['prefix'] +
+                fmt['user'] + prompt +
+                fmt['suffix'] +
+                fmt['model'])
+
+    elif t == 'mistral':
+        # Mistral: [INST] prompt [/INST] (generation follows immediately)
+        return fmt['prefix'] + fmt['user'] + prompt + fmt['suffix']
+
+    elif t == 'chatml':
+        # ChatML: <|user|>\n{prompt}</s>\n<|assistant|>\n
+        return (fmt['prefix'] +
+                fmt['user'] + prompt +
+                fmt['suffix'] + '\n' +
+                fmt['model'])
+
+    elif t == 'phi':
+        return (fmt['prefix'] + fmt['user'] + prompt + fmt['suffix'] + '\n' + fmt['model'])
+
+    elif t == 'stablelm':
+        return (fmt['prefix'] + fmt['user'] + prompt + fmt['suffix'] + fmt['model'])
+
+    else:
+        # Fallback: plain text
+        return prompt
 
 
 def format_ref_for_ppl(ref_text, fmt):
     """Format reference text for PPL evaluation — wraps in appropriate chat template."""
     if fmt is None:
         return ref_text
-    if fmt['type'] == 'gemma':
+    t = fmt['type']
+
+    if t == 'qwen':
+        # Qwen: system msg + user msg (with <|im_end|>) + assistant prompt
+        system_text = fmt.get('system_default', 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.')
+        return ('<|im_start|>system\n' + system_text + '<|im_end|>\n' +
+                '<|im_start|>user\n' + ref_text + '<|im_end|>\n' +
+                '<|im_start|>assistant\n')
+
+    elif t == 'gemma':
         return '<|turn>user\n' + ref_text + '\n<|turn>model\n'
-    elif fmt['type'] == 'llama3':
-        return '<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n' + ref_text + '<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
-    elif fmt['type'] == 'qwen':
-        return '<|im_start|>user\n' + ref_text + '\n<|im_start|>assistant\n'
-    elif fmt['type'] == 'mistral':
+
+    elif t == 'llama3':
+        return ('<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n' +
+                ref_text + '<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n')
+
+    elif t == 'mistral':
         return '[INST] ' + ref_text + ' [/INST] '
-    elif fmt['type'] == 'chatml':
+
+    elif t == 'chatml':
         return '<|user|>\n' + ref_text + '</s>\n<|assistant|>\n'
-    elif fmt['type'] == 'phi':
+
+    elif t == 'phi':
         return '<|user|>\n' + ref_text + '<|assistant|>\n'
-    elif fmt['type'] == 'stablelm':
+
+    elif t == 'stablelm':
         return '<|user|>' + ref_text + '<|assistant|>'
+
     else:
         return ref_text
 
