@@ -936,11 +936,26 @@ def gen(model, tok, prompt, max_new=80, fmt=None, original_prompt=None):
         marker = fmt['model']
         if result.startswith(marker):
             result = result[len(marker):]
-            # Strip any leftover newline after marker (model generates marker\n)
-            if result.startswith('\n'):
-                result = result[1:]
-            # Also strip any leading whitespace/newlines
-            result = result.lstrip()
+        # Strip leftover newlines after marker
+        if result.startswith('\n'):
+            result = result[1:]
+        result = result.lstrip()
+        # Clean up residual special-token markers that model may have emitted
+        t = fmt['type']
+        if t == 'qwen':
+            # Remove any leftover <|im_start|>role\n...<|im_end|> sequences
+            result = re.sub(r'<\|im_start\|>.*?(?=<\|im_start\|>|$)', '', result, flags=re.DOTALL)
+            result = re.sub(r'<\|im_end\|>\n?', '', result)
+            result = result.strip()
+        elif t in ('chatml', 'phi', 'stablelm'):
+            result = result.replace('<|user|>', '').replace('<|assistant|>', '').replace('<|endoftext|>', '')
+            result = result.strip()
+        elif t == 'gemma':
+            result = re.sub(r'<\|turn\|>.*?(?=<\|turn\|>|$)', '', result, flags=re.DOTALL)
+            result = result.strip()
+        elif t == 'llama3':
+            result = re.sub(r'<\|eot_id\|>+', '', result)
+            result = result.strip()
     return result
 
 def ppl(model, tok, text):
