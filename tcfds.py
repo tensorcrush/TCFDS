@@ -1136,7 +1136,8 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user.")
     except Exception as e:
         print(f"\nFATAL: {e}")
         traceback.print_exc()
-        input("Enter to exit...")
