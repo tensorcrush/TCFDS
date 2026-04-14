@@ -864,11 +864,11 @@ def gen(model, tok, prompt, max_new=80, fmt=None, original_prompt=None):
         marker = fmt['model']
         if result.startswith(marker):
             result = result[len(marker):]
-        # Also handle case where result contains original_prompt
-        if original_prompt is not None:
-            idx = result.find(original_prompt)
-            if idx >= 0:
-                result = result[idx + len(original_prompt):]
+            # Strip any leftover newline after marker (model generates marker\n)
+            if result.startswith('\n'):
+                result = result[1:]
+            # Also strip any leading whitespace/newlines
+            result = result.lstrip()
     return result
 
 def ppl(model, tok, text):
