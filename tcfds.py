@@ -469,7 +469,9 @@ def set_mod(model, name, mod):
         parent = getattr(parent, p)
     setattr(parent, parts[-1], mod)
 
-def get_block_groups(model, skip_pats=('lm_head', 'embed', 'norm', 'layernorm'), min_dim=256):
+def get_block_groups(model, skip_pats=('lm_head', 'embed', 'norm', 'layernorm',
+                                           'audio', 'per_layer_input_gate',
+                                           'per_layer_projection', 'per_layer_model_projection'), min_dim=256):
     blocks = defaultdict(list)
     ungrouped = []
     for name, mod in model.named_modules():
