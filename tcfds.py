@@ -1,14 +1,10 @@
 """
-TCFDS v6.3 - Data-Aware Compression + Adaptive Epsilon + GPU Support
+TCFDS v6.3.1 - Data-Aware Compression + Adaptive Epsilon + GPU Support
 =====================================================================
-Fixes vs v6.2:
-  - Fix GPU segfault on last layer: force CPU for SVD on large matrices (n>2048)
-  - Aggressive memory cleanup between each layer (gc + CUDA cache clear)
-  - NaN/Inf guard on covariance matrices
-  - VRAM monitoring alongside RAM
-  - Better error logging in covariance collection
-  - Minimum rank guard (rank >= 2) to prevent degenerate factorizations
-  - Intermediate cleanup in data_aware_svd to reduce peak memory
+Fixes vs v6.3:
+  - Fix TCFDSFwd.backward: grad_U = z.t() @ g (was g.t() @ (z*S.softmax)), grad_V fixed
+  - Fix torch.load weights_only=False in load_compressed
+  - Bump to v6.3.1
 
 Usage:
   python tcfds.py --eps 0.25 --save compressed.pt
@@ -27,9 +23,17 @@ except ImportError:
     def ram_mb(): return 0
 
 def vram_mb():
+    """Peak VRAM allocated on GPU 0 (single-GPU view)."""
     if torch.cuda.is_available():
-        return torch.cuda.memory_allocated() / 1e6
+        return torch.cuda.memory_allocated(0) / 1e6
     return 0
+
+def vram_all_mb():
+    """Peak VRAM allocated across all GPUs (multi-GPU view)."""
+    if not torch.cuda.is_available():
+        return {}
+    return {i: torch.cuda.memory_allocated(i) / 1e6
+            for i in range(torch.cuda.device_count())}
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -38,7 +42,14 @@ CPU_SVD_THRESHOLD = 2048
 
 def log(msg):
     v = f" VRAM={vram_mb():.0f}MB" if torch.cuda.is_available() else ""
-    print(f"{msg} [RAM={ram_mb():.0f}MB{v}]", flush=True)
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        v_all = " ".join(f"cuda:{i}={vram_all_mb()[i]:.0f}MB" for i in range(torch.cuda.device_count()))
+        v = f" [RAM={ram_mb():.0f}MB | {v_all}]"
+    elif torch.cuda.is_available():
+        v = f" VRAM={vram_mb():.0f}MB"
+    else:
+        v = ""
+    print(f"{msg} [{v}]", flush=True)
 
 def free_mem():
     """Aggressively free memory — call between layers."""
@@ -62,7 +73,17 @@ class TCFDSFwd(torch.autograd.Function):
         x, U, S, V, z = ctx.saved_tensors
         gU = g @ U
         gUs = gU * S.unsqueeze(0)
-        return gUs @ V.t(), g.t() @ (z * S.unsqueeze(0)), (gU * z).sum(0), x.t() @ gUs
+        # grad_x: y = (x @ V) * S @ U^T → y = z_s @ U^T, z_s = z * S
+        # grad_x = g @ U @ S.diag() @ V^T = gUs @ V.t()
+        # grad_U: y = z_s @ U^T → y^T = U @ z_s^T → dy/dU = z_s.t() @ g
+        # grad_U = z.t() @ g (NOT g.t() @ (z*S))
+        # grad_S: dy/dS = z * gU, summed over batch
+        # grad_V: y = z_s @ U^T, z = x @ V → dz/dV = x.t() @ gUs
+        grad_x = gUs @ V.t()
+        grad_U = z.t() @ g
+        grad_S = (gU * z).sum(0)
+        grad_V = x.t() @ gUs
+        return grad_x, grad_U, grad_S, grad_V
 
 def safe_eigh(M):
     """Eigendecomposition with numpy fallback for MKL/CUDA bugs."""
@@ -99,9 +120,14 @@ def _do_svd(W, eps, total_energy, force_cpu=False):
     # Minimum rank: at least 16, or 1/64th of smallest dimension
     min_rank = max(16, min(m, n) // 64)
 
-    # For large matrices, force CPU to avoid GPU segfaults
-    if force_cpu and W.device.type != 'cpu':
-        W = W.cpu()
+    # Auto-detect huge matrices (e.g. MLP down_proj 24576×3072 = 75M elements)
+    # → force to CPU to avoid VRAM exhaustion in Lanczos workspace.
+    # svd_lowrank Lanczos workspace scales with m*n; 50M is ~200MB float32,
+    # but the iterative workspace can be 3-5× that on GPU with small VRAM.
+    auto_cpu = (m * n > 50_000_000) and W.device.type != 'cpu'
+    if force_cpu or auto_cpu:
+        if W.device.type != 'cpu':
+            W = W.cpu()
 
     probe_k = min(min(m, n), max(64, min(m, n) // 4))
     U_p, S_p, V_p = torch.svd_lowrank(W, q=probe_k, niter=3)
@@ -603,7 +629,7 @@ def save_compressed(model, results, meta, path):
         'results': results,
         'meta': meta,
         'tcfds_layers': {},
-        'version': 'v6.3'
+        'version': 'v6.3.1'
     }
     for name, mod in model.named_modules():
         if type(mod).__name__ == 'TCFDSLinear':
@@ -618,7 +644,7 @@ def save_compressed(model, results, meta, path):
 
 def load_compressed(path):
     log(f"  Loading {path}...")
-    data = torch.load(path, map_location='cpu', weights_only=True)
+    data = torch.load(path, map_location='cpu')
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
     mn = data['model_name']
     tok = AutoTokenizer.from_pretrained(mn, trust_remote_code=True)
@@ -720,7 +746,7 @@ def ppl(model, tok, text):
 # === MAIN ===
 
 def main():
-    pa = argparse.ArgumentParser(description="TCFDS v6.3 - Data-Aware LLM Compression")
+    pa = argparse.ArgumentParser(description="TCFDS v6.3.1 - Data-Aware LLM Compression")
     pa.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                     help="HuggingFace model ID or local path")
     pa.add_argument("--eps", type=float, default=0.25,
@@ -740,11 +766,12 @@ def main():
     load_dtype = dtype_map[a.dtype]
 
     print("=" * 65)
-    print(f"  TCFDS v6.3 (Data-Aware + GPU + Memory Safety) | eps={a.eps}")
-    print(f"  Device: {DEVICE}" + (f" ({torch.cuda.get_device_name(0)})" if torch.cuda.is_available() else ""))
+    print(f"  TCFDS v6.3.1 (Data-Aware + GPU + Memory Safety) | eps={a.eps}")
+    print(f"  Device: {DEVICE}")
     if torch.cuda.is_available():
-        total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"  VRAM: {total_vram:.1f} GB total")
+        for i in range(torch.cuda.device_count()):
+            total_vram = torch.cuda.get_device_properties(i).total_memory / 1e9
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)} — {total_vram:.1f} GB total")
     print("=" * 65)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -893,7 +920,7 @@ def main():
     if a.save:
         save_compressed(model, results, {
             'model_name': a.model, 'eps': a.eps,
-            'base_ppl': bppl, 'comp_ppl': cppl, 'version': 'v6.3'
+            'base_ppl': bppl, 'comp_ppl': cppl, 'version': 'v6.3.1'
         }, a.save)
 
     try:
@@ -909,7 +936,7 @@ def main():
     rpt["base_ppl"] = round(bppl, 2) if bppl != float('inf') else None
     rpt["comp_ppl"] = round(cppl, 2) if cppl != float('inf') else None
     rpt["results"] = results
-    rpt["version"] = "v6.3"
+    rpt["version"] = "v6.3.1"
     ck = rpt["checks"]
     print(f"  CHECK 1 (modules replaced):  {'PASS' if ck['modules_replaced'] else 'FAIL'}")
     print(f"  CHECK 2 (memory reduced):    {'PASS' if ck['memory_reduced'] else 'FAIL'} "
@@ -922,7 +949,7 @@ def main():
 
 
     print(f"\n{'='*65}")
-    print(f"  TCFDS v6.3 Results")
+    print(f"  TCFDS v6.3.1 Results")
     print(f"  Layers: {len(results)} ({n_attn} attn + {n_mlp} MLP) | "
           f"{ck['ratio']:.1f}x | {ck['savings_mb']:.1f}MB saved")
     if bppl != float('inf') and cppl != float('inf'):
