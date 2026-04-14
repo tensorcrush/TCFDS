@@ -139,13 +139,13 @@ def _do_svd(W, eps, total_energy, force_cpu=False):
         del U, S, V
         return U_out, S_out, Vh_out, k
 
+    # If the probe reached the threshold, we don't need a second SVD!
+    # The first probe (which computes probe_k singular values) already contains
+    # the required k singular vectors since k <= probe_k when reached.any() is True.
+    U_out = U_p[:, :k].to(device)
+    S_out = S_p[:k].to(device)
+    Vh_out = V_p[:, :k].t().to(device)
     del U_p, S_p, V_p
-    q = min(k + 20, min(m, n))
-    U, S, V = torch.svd_lowrank(W, q=q, niter=3)
-    U_out = U[:, :k].to(device)
-    S_out = S[:k].to(device)
-    Vh_out = V[:, :k].t().to(device)
-    del U, S, V
     return U_out, S_out, Vh_out, k
 
 def data_aware_svd(W, Cov, eps):

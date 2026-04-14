@@ -1,0 +1,3 @@
+## 2024-05-19 - Removed redundant low-rank SVD recomputation
+**Learning:** In the `_do_svd` implementation, an initial `torch.svd_lowrank` was being used to "probe" for the optimal rank `k`. However, if the probe successfully found `k`, the code was discarding the probe results and redundantly executing the exact same `torch.svd_lowrank` a second time! This was doubling the time taken for SVD on easily-compressible matrices.
+**Action:** When writing or reviewing matrix factorization algorithms, always check if "probe" or "test" computations already contain the final answer as a subset of their results, and reuse them by slicing rather than discarding and recomputing.
