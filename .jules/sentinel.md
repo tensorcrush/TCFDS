@@ -1,0 +1,4 @@
+## 2024-05-24 - RCE via Insecure Defaults
+**Vulnerability:** The script previously hardcoded `trust_remote_code=True` when loading Hugging Face models and tokenizers, and used `torch.load` without `weights_only=True`. This permitted arbitrary code execution when loading untrusted `.pt` files or external models.
+**Learning:** Hugging Face and PyTorch APIs can easily introduce Arbitrary Code Execution (ACE) vectors. It is imperative that parameters controlling deserialization and execution defaults are set to safe values.
+**Prevention:** Always default `trust_remote_code` to `False` in AutoModel and AutoTokenizer initializations, exposing an explicit CLI flag if it is absolutely necessary. Additionally, enforce `weights_only=True` in `torch.load` unless specifically loading full state configurations, but strictly avoid it when dealing with untrusted model weights.
