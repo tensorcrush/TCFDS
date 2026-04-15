@@ -1,0 +1,3 @@
+## 2026-10-27 - [Avoid materializing Covariance Square Roots]
+**Learning:** [In data-aware SVD, computing the square root of the covariance matrix ($C^{1/2}$) and its inverse is computationally expensive ($O(n^3)$) and memory-intensive ($O(n^2)$). The codebase was originally constructing full $N \times N$ matrices for this step.]
+**Action:** [Instead of materializing $C^{1/2} = V_C D_{C}^{1/2} V_C^T$, apply the eigenvectors and scaled eigenvalues directly to the weight matrix ($W_{weighted} = (W V_C) D_C^{1/2}$) and leverage the unitary invariance of the Frobenius norm ($||AQ||_F = ||A||_F$) to calculate errors. This preserves mathematical equivalence while drastically reducing peak memory and computational complexity.]

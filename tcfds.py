@@ -391,24 +391,21 @@ def data_aware_svd(W, Cov, eps):
     sqrt_ev = eigvals.sqrt()
     inv_sqrt_ev = 1.0 / sqrt_ev
 
-    # Build Cov^{1/2} and Cov^{-1/2} on CPU if large
     compute_device = torch.device('cpu') if force_cpu else eigvecs.device
     eigvecs_c = eigvecs.to(compute_device)
     sqrt_ev_c = sqrt_ev.to(compute_device)
     inv_sqrt_ev_c = inv_sqrt_ev.to(compute_device)
 
-    Cov_sqrt = (eigvecs_c * sqrt_ev_c.unsqueeze(0)) @ eigvecs_c.t()
-    Cov_sqrt_inv = (eigvecs_c * inv_sqrt_ev_c.unsqueeze(0)) @ eigvecs_c.t()
-    del eigvals, eigvecs, sqrt_ev, inv_sqrt_ev, eigvecs_c, sqrt_ev_c, inv_sqrt_ev_c
+    del eigvals, eigvecs, sqrt_ev, inv_sqrt_ev
 
-    # Weighted matrix
+    # Weighted matrix without materializing Cov_sqrt
     W_c = W.to(compute_device) if W.device != compute_device else W
-    W_weighted = W_c @ Cov_sqrt
+    W_weighted = (W_c @ eigvecs_c) * sqrt_ev_c.unsqueeze(0)
     total_energy = (W_weighted**2).sum().item()
 
     if total_energy < 1e-12:
         log(f"    WARNING: near-zero energy in weighted matrix, falling back to standard SVD")
-        del Cov_sqrt, Cov_sqrt_inv, W_weighted
+        del W_weighted, eigvecs_c, sqrt_ev_c, inv_sqrt_ev_c
         U, S, Vh, k = standard_svd(W, eps)
         return U, S, Vh, k, None
 
@@ -419,12 +416,12 @@ def data_aware_svd(W, Cov, eps):
         del W_c
 
     # Transform V back from covariance-weighted space
-    Vh_orig = Vh @ Cov_sqrt_inv.to(Vh.device)
-    del Cov_sqrt_inv, Vh
+    Vh_orig = (Vh * inv_sqrt_ev_c.unsqueeze(0).to(Vh.device)) @ eigvecs_c.t().to(Vh.device)
+    del Vh
     free_mem()
 
-    # Return Cov_sqrt for reuse in error computation (avoids second eigh)
-    return U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k, Cov_sqrt.to(W.device)
+    # Return eigvecs and sqrt_ev for reuse in error computation (avoids materializing Cov_sqrt or doing second eigh)
+    return U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k, (eigvecs_c.to(W.device), sqrt_ev_c.to(W.device))
 
 def standard_svd(W, eps):
     """Standard SVD without data-aware weighting."""
@@ -447,9 +444,9 @@ class TCFDSLinear(nn.Module):
     @classmethod
     def from_weight(cls, W_f32, bias_f32, eps, store_dtype, Cov=None):
         m, n = W_f32.shape
-        Cov_sqrt = None
+        eig_info = None
         if Cov is not None:
-            U, S, Vh, k, Cov_sqrt = data_aware_svd(W_f32, Cov, eps)
+            U, S, Vh, k, eig_info = data_aware_svd(W_f32, Cov, eps)
         else:
             U, S, Vh, k = standard_svd(W_f32, eps)
 
@@ -460,11 +457,12 @@ class TCFDSLinear(nn.Module):
         rel_err = diff.norm().item() / max(w_norm, 1e-12)
         data_err = rel_err
 
-        if Cov_sqrt is not None:
-            # Reuse Cov_sqrt from data_aware_svd (no second eigendecomposition)
-            data_err = (diff @ Cov_sqrt).norm().item() / max((W_f32 @ Cov_sqrt).norm().item(), 1e-12)
+        if eig_info is not None:
+            # Reuse eigvecs and sqrt_ev from data_aware_svd (no second eigendecomposition)
+            eigvecs, sqrt_ev = eig_info
+            data_err = ((diff @ eigvecs) * sqrt_ev.unsqueeze(0)).norm().item() / max(((W_f32 @ eigvecs) * sqrt_ev.unsqueeze(0)).norm().item(), 1e-12)
 
-        del W_approx, diff, Cov_sqrt
+        del W_approx, diff, eig_info
 
         orig_p = m * n + (m if bias_f32 is not None else 0)
         comp_p = k * (m + n) + k + (m if bias_f32 is not None else 0)
