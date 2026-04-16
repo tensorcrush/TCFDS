@@ -37,7 +37,32 @@ def vram_all_mb():
     return {i: torch.cuda.memory_allocated(i) / 1e6
             for i in range(torch.cuda.device_count())}
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _backend_available(backend):
+    """Return True if a torch backend exists and reports availability."""
+    b = getattr(torch, backend, None)
+    return bool(b is not None and hasattr(b, "is_available") and b.is_available())
+
+
+def resolve_device(preferred="auto"):
+    """Resolve runtime device with explicit preference or auto-detection."""
+    preferred = (preferred or "auto").lower()
+    if preferred == "auto":
+        for cand in ("cuda", "xpu", "npu"):
+            if _backend_available(cand):
+                return torch.device(cand)
+        return torch.device("cpu")
+
+    if preferred == "cpu":
+        return torch.device("cpu")
+    if preferred in ("cuda", "xpu", "npu"):
+        if _backend_available(preferred):
+            return torch.device(preferred)
+        raise RuntimeError(f"Requested device '{preferred}' is not available on this machine.")
+
+    raise ValueError(f"Unsupported device '{preferred}'. Use auto/cpu/cuda/xpu/npu.")
+
+
+DEVICE = resolve_device("auto")
 
 # Threshold above which SVD/eigh operations are forced to CPU to avoid GPU segfaults
 CPU_SVD_THRESHOLD = 2048
@@ -975,6 +1000,7 @@ def ppl(model, tok, text):
 # === MAIN ===
 
 def main():
+    global DEVICE
     pa = argparse.ArgumentParser(description="TCFDS v6.4.0 - Data-Aware LLM Compression")
     pa.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                     help="HuggingFace model ID or local path")
@@ -989,7 +1015,11 @@ def main():
     pa.add_argument("--dtype", type=str, default="float16",
                     choices=["float16", "float32", "bfloat16"],
                     help="Model precision (float16 saves RAM, default: float16)")
+    pa.add_argument("--device", type=str, default="auto",
+                    choices=["auto", "cpu", "cuda", "xpu", "npu"],
+                    help="Execution backend: auto, cpu, cuda, xpu, or npu")
     a = pa.parse_args()
+    DEVICE = resolve_device(a.device)
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
     load_dtype = dtype_map[a.dtype]
@@ -997,10 +1027,12 @@ def main():
     print("=" * 65)
     print(f"  TCFDS v6.4.0 (Data-Aware + GPU + Memory Safety) | eps={a.eps}")
     print(f"  Device: {DEVICE}")
-    if torch.cuda.is_available():
+    if DEVICE.type == "cuda" and torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             total_vram = torch.cuda.get_device_properties(i).total_memory / 1e9
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)} — {total_vram:.1f} GB total")
+    elif DEVICE.type in ("xpu", "npu"):
+        print(f"  Accelerator backend selected: {DEVICE.type} (PyTorch backend mode)")
     print("=" * 65)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -1049,11 +1081,13 @@ def main():
     # load time avoids Windows page-file blow-up observed on 16 GB machines).
     # dtype conversion happens *after* the model is in memory.
     model = None
-    strategies = [
-        ("multi-GPU", {"device_map": "auto", "torch_dtype": load_dtype}),
+    strategies = []
+    if DEVICE.type == "cuda":
+        strategies.append(("multi-GPU", {"device_map": "auto", "torch_dtype": load_dtype}))
+    strategies.extend([
         ("CPU-lowmem", dict(low_cpu_mem_usage=True)),
         ("CPU-minimal", dict()),
-    ]
+    ])
 
     for name, kwargs in strategies:
         try:

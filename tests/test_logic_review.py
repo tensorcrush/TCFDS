@@ -77,3 +77,31 @@ def test_torch_load_compat_fallback_when_weights_only_unsupported(monkeypatch):
 def test_detect_chat_format_specificity_basics():
     assert tcfds.detect_chat_format("meta-llama/Llama-3-8B")['type'] == 'llama3'
     assert tcfds.detect_chat_format("TinyLlama/TinyLlama-1.1B-Chat-v1.0")['type'] == 'chatml'
+
+
+def test_resolve_device_auto_prefers_xpu_when_cuda_unavailable(monkeypatch):
+    class _Backend:
+        def __init__(self, available):
+            self._available = available
+
+        def is_available(self):
+            return self._available
+
+    monkeypatch.setattr(tcfds.torch, "cuda", _Backend(False), raising=True)
+    monkeypatch.setattr(tcfds.torch, "xpu", _Backend(True), raising=False)
+    monkeypatch.setattr(tcfds.torch, "npu", _Backend(False), raising=False)
+    dev = tcfds.resolve_device("auto")
+    assert dev.type == "xpu"
+
+
+def test_resolve_device_raises_when_requested_backend_missing(monkeypatch):
+    class _Backend:
+        def is_available(self):
+            return False
+
+    monkeypatch.setattr(tcfds.torch, "xpu", _Backend(), raising=False)
+    try:
+        tcfds.resolve_device("xpu")
+        assert False, "Expected RuntimeError for unavailable xpu backend"
+    except RuntimeError:
+        pass
