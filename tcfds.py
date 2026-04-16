@@ -391,40 +391,41 @@ def data_aware_svd(W, Cov, eps):
     sqrt_ev = eigvals.sqrt()
     inv_sqrt_ev = 1.0 / sqrt_ev
 
-    # Build Cov^{1/2} and Cov^{-1/2} on CPU if large
+    # Build Cov^{1/2} implicitly on CPU if large
     compute_device = torch.device('cpu') if force_cpu else eigvecs.device
     eigvecs_c = eigvecs.to(compute_device)
     sqrt_ev_c = sqrt_ev.to(compute_device)
     inv_sqrt_ev_c = inv_sqrt_ev.to(compute_device)
+    del eigvals, eigvecs, sqrt_ev, inv_sqrt_ev
 
-    Cov_sqrt = (eigvecs_c * sqrt_ev_c.unsqueeze(0)) @ eigvecs_c.t()
-    Cov_sqrt_inv = (eigvecs_c * inv_sqrt_ev_c.unsqueeze(0)) @ eigvecs_c.t()
-    del eigvals, eigvecs, sqrt_ev, inv_sqrt_ev, eigvecs_c, sqrt_ev_c, inv_sqrt_ev_c
-
-    # Weighted matrix
+    # Weighted matrix implicitly computed: (W @ E) * D^{1/2}
+    # This avoids materializing the dense Cov_sqrt and Cov_sqrt_inv matrices
     W_c = W.to(compute_device) if W.device != compute_device else W
-    W_weighted = W_c @ Cov_sqrt
-    total_energy = (W_weighted**2).sum().item()
+    W_weighted_compact = (W_c @ eigvecs_c) * sqrt_ev_c.unsqueeze(0)
+    total_energy = (W_weighted_compact**2).sum().item()
 
     if total_energy < 1e-12:
         log(f"    WARNING: near-zero energy in weighted matrix, falling back to standard SVD")
-        del Cov_sqrt, Cov_sqrt_inv, W_weighted
+        del eigvecs_c, sqrt_ev_c, inv_sqrt_ev_c, W_weighted_compact
         U, S, Vh, k = standard_svd(W, eps)
         return U, S, Vh, k, None
 
     # SVD on weighted matrix (on compute_device, which may be CPU)
-    U, S, Vh, k = _do_svd(W_weighted, eps, total_energy, force_cpu=False)
-    del W_weighted
+    U, S, Vh_compact, k = _do_svd(W_weighted_compact, eps, total_energy, force_cpu=False)
+    del W_weighted_compact
     if W_c is not W:
         del W_c
 
     # Transform V back from covariance-weighted space
-    Vh_orig = Vh @ Cov_sqrt_inv.to(Vh.device)
-    del Cov_sqrt_inv, Vh
+    # Vh_orig = Vh_compact @ D^{-1/2} @ E^T
+    Vh_orig = (Vh_compact * inv_sqrt_ev_c.unsqueeze(0)) @ eigvecs_c.t()
+    Vh_orig = Vh_orig.to(W.device)
+    del inv_sqrt_ev_c, Vh_compact
     free_mem()
 
-    # Return Cov_sqrt for reuse in error computation (avoids second eigh)
-    return U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k, Cov_sqrt.to(W.device)
+    cov_info = (eigvecs_c, sqrt_ev_c)
+    # Return cov_info for reuse in error computation (avoids second eigh)
+    return U.to(W.device), S.to(W.device), Vh_orig, k, cov_info
 
 def standard_svd(W, eps):
     """Standard SVD without data-aware weighting."""
@@ -447,9 +448,9 @@ class TCFDSLinear(nn.Module):
     @classmethod
     def from_weight(cls, W_f32, bias_f32, eps, store_dtype, Cov=None):
         m, n = W_f32.shape
-        Cov_sqrt = None
+        cov_info = None
         if Cov is not None:
-            U, S, Vh, k, Cov_sqrt = data_aware_svd(W_f32, Cov, eps)
+            U, S, Vh, k, cov_info = data_aware_svd(W_f32, Cov, eps)
         else:
             U, S, Vh, k = standard_svd(W_f32, eps)
 
@@ -460,11 +461,22 @@ class TCFDSLinear(nn.Module):
         rel_err = diff.norm().item() / max(w_norm, 1e-12)
         data_err = rel_err
 
-        if Cov_sqrt is not None:
-            # Reuse Cov_sqrt from data_aware_svd (no second eigendecomposition)
-            data_err = (diff @ Cov_sqrt).norm().item() / max((W_f32 @ Cov_sqrt).norm().item(), 1e-12)
+        if cov_info is not None:
+            # Reuse cov_info from data_aware_svd (no second eigendecomposition)
+            eigvecs_c, sqrt_ev_c = cov_info
 
-        del W_approx, diff, Cov_sqrt
+            # Ensure diff and W_f32 are on the same device as cov_info
+            diff_c = diff.to(eigvecs_c.device) if diff.device != eigvecs_c.device else diff
+            W_c = W_f32.to(eigvecs_c.device) if W_f32.device != eigvecs_c.device else W_f32
+
+            data_err = ((diff_c @ eigvecs_c) * sqrt_ev_c.unsqueeze(0)).norm().item() / \
+                       max(((W_c @ eigvecs_c) * sqrt_ev_c.unsqueeze(0)).norm().item(), 1e-12)
+
+            if diff_c is not diff: del diff_c
+            if W_c is not W_f32: del W_c
+
+        del W_approx, diff
+        if cov_info is not None: del cov_info
 
         orig_p = m * n + (m if bias_f32 is not None else 0)
         comp_p = k * (m + n) + k + (m if bias_f32 is not None else 0)
