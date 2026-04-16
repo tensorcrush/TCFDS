@@ -1,0 +1,4 @@
+## 2024-05-24 - [Insecure ML Deserialization & RCE]
+**Vulnerability:** Found `torch.load` missing `weights_only=True` allowing arbitrary code execution via Pickled objects, and `trust_remote_code=True` hardcoded for HuggingFace `AutoTokenizer`, `AutoConfig`, and `AutoModelForCausalLM` loading methods.
+**Learning:** Machine Learning repositories often default to insecure loading mechanisms. Pickle deserialization executes code natively, and HuggingFace models can include Python scripts that execute automatically on load if `trust_remote_code=True` is provided. This exposes the user to immediate RCE.
+**Prevention:** Always enforce `weights_only=True` when deserializing PyTorch `.pt` or `.bin` files via `torch.load`. For HuggingFace dependencies, default `trust_remote_code=False` and require users to explicitly opt-in via a flag (e.g. `--trust-remote-code`) if executing remote model code is absolutely necessary.
