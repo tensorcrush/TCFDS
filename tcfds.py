@@ -270,12 +270,11 @@ class TCFDSFwd(torch.autograd.Function):
         gUs = gU * S.unsqueeze(0)
         # grad_x: y = (x @ V) * S @ U^T → y = z_s @ U^T, z_s = z * S
         # grad_x = g @ U @ S.diag() @ V^T = gUs @ V.t()
-        # grad_U: y = z_s @ U^T → y^T = U @ z_s^T → dy/dU = z_s.t() @ g
-        # grad_U = z.t() @ g (NOT g.t() @ (z*S))
+        # grad_U: y = z_s @ U^T, so grad_U = g^T @ z_s (shape m x k)
         # grad_S: dy/dS = z * gU, summed over batch
         # grad_V: y = z_s @ U^T, z = x @ V → dz/dV = x.t() @ gUs
         grad_x = gUs @ V.t()
-        grad_U = z.t() @ g
+        grad_U = g.t() @ (z * S.unsqueeze(0))
         grad_S = (gU * z).sum(0)
         grad_V = x.t() @ gUs
         return grad_x, grad_U, grad_S, grad_V
@@ -313,7 +312,7 @@ def _do_svd(W, eps, total_energy, force_cpu=False):
     threshold = 1.0 - eps**2 / 2.0
     device = W.device
     # Minimum rank: at least 16, or 1/64th of smallest dimension
-    min_rank = max(16, min(m, n) // 64)
+    min_rank = min(max(16, min(m, n) // 64), min(m, n))
 
     # Auto-detect huge matrices (e.g. MLP down_proj 24576×3072 = 75M elements)
     # → force to CPU to avoid VRAM exhaustion in Lanczos workspace.
@@ -839,9 +838,16 @@ def save_compressed(model, results, meta, path):
     torch.save(data, path)
     log(f"  Saved: {os.path.getsize(path)/1e6:.0f} MB")
 
+def torch_load_compat(path, map_location='cpu'):
+    """Compat wrapper for torch.load across PyTorch versions."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
 def load_compressed(path):
     log(f"  Loading {path}...")
-    data = torch.load(path, map_location='cpu')
+    data = torch_load_compat(path, map_location='cpu')
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
     mn = data['model_name']
     tok = AutoTokenizer.from_pretrained(mn, trust_remote_code=True)
@@ -1180,7 +1186,7 @@ def main():
     print(f"  CHECK 3 (structured SVD):    {'PASS' if ck['structured'] else 'FAIL'} "
           f"(SV ranges: {ck['sv_ranges']})")
     print(f"  >>> {rpt['verdict']} <<<")
-    with open("tcfds_report_v63.json", "w") as f:
+    with open("tcfds_report_v64.json", "w") as f:
         json.dump(rpt, f, indent=2, default=str)
 
 
