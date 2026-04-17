@@ -1,0 +1,3 @@
+## 2024-04-17 - Add `readline` for better CLI chat experience
+**Learning:** For Python CLI tools that rely on a continuous `input()` loop for chat or interaction, users expect standard terminal features like arrow-key navigation, editing their line, and recalling history using the 'Up' arrow. Without it, pressing 'Up' prints escape sequences like `^[[A`. The standard library `readline` module hooks into `input()` automatically upon import to provide these features.
+**Action:** When working on CLI loops using `input()`, wrap `import readline` in a `try...except ImportError: pass` block to gracefully enable line editing and history on supported systems (Unix-like) without breaking on others.
