@@ -839,19 +839,19 @@ def save_compressed(model, results, meta, path):
     torch.save(data, path)
     log(f"  Saved: {os.path.getsize(path)/1e6:.0f} MB")
 
-def load_compressed(path):
+def load_compressed(path, trust_remote_code=False):
     log(f"  Loading {path}...")
-    data = torch.load(path, map_location='cpu')
+    data = torch.load(path, map_location='cpu', weights_only=True)
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
     mn = data['model_name']
-    tok = AutoTokenizer.from_pretrained(mn, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(mn, trust_remote_code=trust_remote_code)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     try:
         config = AutoConfig.from_dict(data['config'])
     except Exception:
-        config = AutoConfig.from_pretrained(mn, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(mn, trust_remote_code=trust_remote_code)
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=trust_remote_code)
     for name, info in data['tcfds_layers'].items():
         t = TCFDSLinear(
             m=info['m'], n=info['n'], rank=info['rank'],
@@ -983,6 +983,8 @@ def main():
     pa.add_argument("--dtype", type=str, default="float16",
                     choices=["float16", "float32", "bfloat16"],
                     help="Model precision (float16 saves RAM, default: float16)")
+    pa.add_argument("--trust-remote-code", action="store_true",
+                    help="Trust remote code when loading models (security risk)")
     a = pa.parse_args()
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
@@ -1000,7 +1002,7 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     if a.load:
-        model, tok, results, meta = load_compressed(a.load)
+        model, tok, results, meta = load_compressed(a.load, trust_remote_code=a.trust_remote_code)
         if not a.chat_only:
             ref = "The Transformer uses self-attention to process sequences in parallel."
             try:
@@ -1034,7 +1036,7 @@ def main():
 
     # [1] Load model
     log(f"\n[1/6] Loading model...")
-    tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=a.trust_remote_code)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     log(f"  Loading in {a.dtype}...")
@@ -1053,7 +1055,7 @@ def main():
         try:
             log(f"  Strategy: {name}...")
             model = AutoModelForCausalLM.from_pretrained(
-                a.model, trust_remote_code=True, **kwargs
+                a.model, trust_remote_code=a.trust_remote_code, **kwargs
             )
             log(f"  Model loaded via {name}")
             break
