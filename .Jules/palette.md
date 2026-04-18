@@ -1,0 +1,3 @@
+## 2024-06-25 - Python CLI Input UX
+**Learning:** Python's built-in `input()` function lacks basic command line editing features (like using arrow keys to navigate the cursor or command history) out-of-the-box on many Unix-like systems. This leads to a frustrating user experience where a simple typo requires re-typing the entire line.
+**Action:** Simply importing the `readline` module (`import readline`) globally enhances the `input()` function with these capabilities on systems that support it. Always include this when building interactive CLI prompts in Python, wrapping it in a `try...except ImportError` block to gracefully handle platforms (like standard Windows) where it might not be available.
