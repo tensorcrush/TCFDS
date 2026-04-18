@@ -1,0 +1,3 @@
+## $(date +%Y-%m-%d) - Data-aware SVD O(n^3) Avoidance
+**Learning:** Dense intermediate operations on large hidden sizes ($n \approx 4096$) like matrix square roots ($O(n^3)$) and explicitly forming $N \times N$ multiplier matrices are critical bottlenecks in the SVD loop.
+**Action:** Exploit orthogonal properties ($V \cdot V^T = I$) of covariance eigendecomposition to multiply eigenvectors and eigenvalues directly into the weights ($W \cdot V \cdot D^{1/2}$), rather than explicitly materializing a dense square root matrix ($Cov^{1/2} = V \cdot D^{1/2} \cdot V^T$) and multiplying it. This reduces time complexity from $O(n^3)$ to $O(mn^2)$ and significantly reduces peak VRAM.
