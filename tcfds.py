@@ -391,40 +391,56 @@ def data_aware_svd(W, Cov, eps):
     sqrt_ev = eigvals.sqrt()
     inv_sqrt_ev = 1.0 / sqrt_ev
 
-    # Build Cov^{1/2} and Cov^{-1/2} on CPU if large
+    # Build components on CPU if large
     compute_device = torch.device('cpu') if force_cpu else eigvecs.device
     eigvecs_c = eigvecs.to(compute_device)
     sqrt_ev_c = sqrt_ev.to(compute_device)
     inv_sqrt_ev_c = inv_sqrt_ev.to(compute_device)
 
-    Cov_sqrt = (eigvecs_c * sqrt_ev_c.unsqueeze(0)) @ eigvecs_c.t()
-    Cov_sqrt_inv = (eigvecs_c * inv_sqrt_ev_c.unsqueeze(0)) @ eigvecs_c.t()
-    del eigvals, eigvecs, sqrt_ev, inv_sqrt_ev, eigvecs_c, sqrt_ev_c, inv_sqrt_ev_c
+    del eigvals, eigvecs, sqrt_ev, inv_sqrt_ev
 
-    # Weighted matrix
+    # Instead of creating explicitly the dense n x n matrices Cov_sqrt and Cov_sqrt_inv,
+    # we exploit eigenvectors and eigenvalues directly.
+    # W_weighted = W @ Cov_sqrt = W @ V @ S^{1/2} @ V^T
+    # We instead compute A = (W @ V) @ S^{1/2}
+    # SVD on W_weighted vs A yields the same left singular vectors and singular values
+    # because V^T is an orthogonal matrix.
     W_c = W.to(compute_device) if W.device != compute_device else W
-    W_weighted = W_c @ Cov_sqrt
-    total_energy = (W_weighted**2).sum().item()
+
+    # A = (W @ V) @ S^{1/2}
+    A = (W_c @ eigvecs_c) * sqrt_ev_c.unsqueeze(0)
+    total_energy = (A**2).sum().item()
 
     if total_energy < 1e-12:
         log(f"    WARNING: near-zero energy in weighted matrix, falling back to standard SVD")
-        del Cov_sqrt, Cov_sqrt_inv, W_weighted
+        del A, eigvecs_c, sqrt_ev_c, inv_sqrt_ev_c
+        if W_c is not W:
+            del W_c
         U, S, Vh, k = standard_svd(W, eps)
         return U, S, Vh, k, None
 
-    # SVD on weighted matrix (on compute_device, which may be CPU)
-    U, S, Vh, k = _do_svd(W_weighted, eps, total_energy, force_cpu=False)
-    del W_weighted
+    # SVD on A matrix (on compute_device, which may be CPU)
+    U, S, Vh_A, k = _do_svd(A, eps, total_energy, force_cpu=False)
+    del A
     if W_c is not W:
         del W_c
 
     # Transform V back from covariance-weighted space
-    Vh_orig = Vh @ Cov_sqrt_inv.to(Vh.device)
-    del Cov_sqrt_inv, Vh
+    # The right singular vectors of W_weighted are Vh_A @ V^T
+    # Vh_orig = (Vh_A @ V^T) @ Cov_sqrt_inv
+    # = Vh_A @ V^T @ (V @ S^{-1/2} @ V^T)
+    # = Vh_A @ S^{-1/2} @ V^T
+    inv_sqrt_ev_c_device = inv_sqrt_ev_c.to(Vh_A.device)
+    eigvecs_c_device = eigvecs_c.to(Vh_A.device)
+
+    Vh_orig = (Vh_A * inv_sqrt_ev_c_device.unsqueeze(0)) @ eigvecs_c_device.t()
+
+    del Vh_A, inv_sqrt_ev_c, inv_sqrt_ev_c_device, eigvecs_c_device
     free_mem()
 
-    # Return Cov_sqrt for reuse in error computation (avoids second eigh)
-    return U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k, Cov_sqrt.to(W.device)
+    # Return (eigvecs_c, sqrt_ev_c) for reuse in error computation (avoids second eigh)
+    # This avoids creating the dense Cov_sqrt n x n matrix altogether.
+    return U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k, (eigvecs_c.to(W.device), sqrt_ev_c.to(W.device))
 
 def standard_svd(W, eps):
     """Standard SVD without data-aware weighting."""
@@ -447,9 +463,9 @@ class TCFDSLinear(nn.Module):
     @classmethod
     def from_weight(cls, W_f32, bias_f32, eps, store_dtype, Cov=None):
         m, n = W_f32.shape
-        Cov_sqrt = None
+        Cov_eigen = None
         if Cov is not None:
-            U, S, Vh, k, Cov_sqrt = data_aware_svd(W_f32, Cov, eps)
+            U, S, Vh, k, Cov_eigen = data_aware_svd(W_f32, Cov, eps)
         else:
             U, S, Vh, k = standard_svd(W_f32, eps)
 
@@ -460,11 +476,15 @@ class TCFDSLinear(nn.Module):
         rel_err = diff.norm().item() / max(w_norm, 1e-12)
         data_err = rel_err
 
-        if Cov_sqrt is not None:
-            # Reuse Cov_sqrt from data_aware_svd (no second eigendecomposition)
-            data_err = (diff @ Cov_sqrt).norm().item() / max((W_f32 @ Cov_sqrt).norm().item(), 1e-12)
+        if Cov_eigen is not None:
+            # Reuse eigenvectors and square root eigenvalues from data_aware_svd
+            # (no second eigendecomposition or explicitly computing Cov_sqrt matrix).
+            # The Frobenius norm is unitary invariant, so the right multiplication by
+            # the orthogonal matrix `eigvecs.t()` from the original Cov_sqrt logic is avoided.
+            eigvecs, sqrt_ev = Cov_eigen
+            data_err = (diff @ eigvecs * sqrt_ev.unsqueeze(0)).norm().item() / max((W_f32 @ eigvecs * sqrt_ev.unsqueeze(0)).norm().item(), 1e-12)
 
-        del W_approx, diff, Cov_sqrt
+        del W_approx, diff, Cov_eigen
 
         orig_p = m * n + (m if bias_f32 is not None else 0)
         comp_p = k * (m + n) + k + (m if bias_f32 is not None else 0)
