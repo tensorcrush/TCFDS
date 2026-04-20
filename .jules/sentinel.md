@@ -1,0 +1,4 @@
+## 2024-05-18 - Prevent Insecure Deserialization (RCE) in Model Loading
+**Vulnerability:** The project loaded PyTorch models using `torch.load` with `weights_only=False` (the default in older PyTorch versions) and HuggingFace models using `trust_remote_code=True` hardcoded. This allows Arbitrary Code Execution (RCE) when loading untrusted models.
+**Learning:** Even though the project only handles model weights and metadata, malicious `.pt` files or HuggingFace models could execute arbitrary code upon load. Hardcoding `trust_remote_code=True` bypassing security warnings entirely.
+**Prevention:** Always default to `weights_only=True` for `torch.load` and `trust_remote_code=False` for HuggingFace `AutoModel` / `AutoTokenizer`. Only allow remote code execution via explicit user opt-in (e.g., a `--trust-remote-code` CLI flag).
