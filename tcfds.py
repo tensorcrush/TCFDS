@@ -19,6 +19,11 @@ import numpy as np
 from collections import defaultdict
 
 try:
+    import readline
+except ImportError:
+    pass
+
+try:
     import psutil
     def ram_mb(): return psutil.Process(os.getpid()).memory_info().rss / 1e6
 except ImportError:
