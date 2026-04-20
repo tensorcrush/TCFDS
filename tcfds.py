@@ -371,8 +371,8 @@ def _do_svd(W, eps, total_energy, force_cpu=False):
 
 def data_aware_svd(W, Cov, eps):
     """Covariance-weighted SVD. Forces CPU for large matrices.
-    Returns (U, S, Vh, k, Cov_sqrt) — Cov_sqrt is returned so callers
-    can compute the data-aware error without a second eigendecomposition."""
+    Returns (U, S, Vh, k, (eigvecs, sqrt_ev)) — eigenvectors and roots are returned
+    so callers can compute the data-aware error without a second eigendecomposition."""
     m, n = W.shape
     # svd_lowrank is iterative and GPU-safe; only force CPU for eigh (done in safe_eigh)
     force_cpu = False
@@ -391,24 +391,24 @@ def data_aware_svd(W, Cov, eps):
     sqrt_ev = eigvals.sqrt()
     inv_sqrt_ev = 1.0 / sqrt_ev
 
-    # Build Cov^{1/2} and Cov^{-1/2} on CPU if large
     compute_device = torch.device('cpu') if force_cpu else eigvecs.device
     eigvecs_c = eigvecs.to(compute_device)
     sqrt_ev_c = sqrt_ev.to(compute_device)
     inv_sqrt_ev_c = inv_sqrt_ev.to(compute_device)
 
-    Cov_sqrt = (eigvecs_c * sqrt_ev_c.unsqueeze(0)) @ eigvecs_c.t()
-    Cov_sqrt_inv = (eigvecs_c * inv_sqrt_ev_c.unsqueeze(0)) @ eigvecs_c.t()
-    del eigvals, eigvecs, sqrt_ev, inv_sqrt_ev, eigvecs_c, sqrt_ev_c, inv_sqrt_ev_c
+    # Free the original tensor resources early
+    del eigvals, eigvecs, sqrt_ev, inv_sqrt_ev
 
-    # Weighted matrix
+    # Weighted matrix: exploit unitary property instead of materializing Cov^{1/2}
+    # O(m n^2) complexity instead of O(n^3) for covariance square root formulation
     W_c = W.to(compute_device) if W.device != compute_device else W
-    W_weighted = W_c @ Cov_sqrt
+    W_weighted = ((W_c @ eigvecs_c) * sqrt_ev_c) @ eigvecs_c.t()
+
     total_energy = (W_weighted**2).sum().item()
 
     if total_energy < 1e-12:
         log(f"    WARNING: near-zero energy in weighted matrix, falling back to standard SVD")
-        del Cov_sqrt, Cov_sqrt_inv, W_weighted
+        del W_weighted
         U, S, Vh, k = standard_svd(W, eps)
         return U, S, Vh, k, None
 
@@ -419,12 +419,16 @@ def data_aware_svd(W, Cov, eps):
         del W_c
 
     # Transform V back from covariance-weighted space
-    Vh_orig = Vh @ Cov_sqrt_inv.to(Vh.device)
-    del Cov_sqrt_inv, Vh
+    # Vh @ Cov^{-1/2} computed implicitly via eigenvectors
+    eigvecs_vh = eigvecs_c.to(Vh.device)
+    inv_sqrt_ev_vh = inv_sqrt_ev_c.to(Vh.device)
+    Vh_orig = ((Vh @ eigvecs_vh) * inv_sqrt_ev_vh) @ eigvecs_vh.t()
+
+    del Vh, inv_sqrt_ev_c, inv_sqrt_ev_vh
     free_mem()
 
-    # Return Cov_sqrt for reuse in error computation (avoids second eigh)
-    return U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k, Cov_sqrt.to(W.device)
+    # Return eigvecs and sqrt_ev for reuse in error computation
+    return U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k, (eigvecs_c.to(W.device), sqrt_ev_c.to(W.device))
 
 def standard_svd(W, eps):
     """Standard SVD without data-aware weighting."""
@@ -447,9 +451,9 @@ class TCFDSLinear(nn.Module):
     @classmethod
     def from_weight(cls, W_f32, bias_f32, eps, store_dtype, Cov=None):
         m, n = W_f32.shape
-        Cov_sqrt = None
+        eig_data = None
         if Cov is not None:
-            U, S, Vh, k, Cov_sqrt = data_aware_svd(W_f32, Cov, eps)
+            U, S, Vh, k, eig_data = data_aware_svd(W_f32, Cov, eps)
         else:
             U, S, Vh, k = standard_svd(W_f32, eps)
 
@@ -460,11 +464,15 @@ class TCFDSLinear(nn.Module):
         rel_err = diff.norm().item() / max(w_norm, 1e-12)
         data_err = rel_err
 
-        if Cov_sqrt is not None:
-            # Reuse Cov_sqrt from data_aware_svd (no second eigendecomposition)
-            data_err = (diff @ Cov_sqrt).norm().item() / max((W_f32 @ Cov_sqrt).norm().item(), 1e-12)
+        if eig_data is not None:
+            # Reuse eigvecs and sqrt_ev from data_aware_svd (no second eigendecomposition)
+            # Utilizing the unitary property: norm(X @ eigvecs.t()) == norm(X)
+            # Therefore, norm(X @ Cov_sqrt) == norm(X @ eigvecs @ diag(sqrt_ev))
+            # This avoids materializing the O(n^2) dense Cov_sqrt intermediate.
+            eigvecs, sqrt_ev = eig_data
+            data_err = ((diff @ eigvecs) * sqrt_ev).norm().item() / max(((W_f32 @ eigvecs) * sqrt_ev).norm().item(), 1e-12)
 
-        del W_approx, diff, Cov_sqrt
+        del W_approx, diff, eig_data
 
         orig_p = m * n + (m if bias_f32 is not None else 0)
         comp_p = k * (m + n) + k + (m if bias_f32 is not None else 0)

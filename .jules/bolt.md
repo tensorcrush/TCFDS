@@ -1,0 +1,5 @@
+## 2024-04-20 - Exploiting Unitary Properties in Data-Aware SVD
+
+**Learning:** When performing data-aware SVD and related error calculations, calculating intermediate dense matrices (like the square root of the covariance matrix) via full eigendecomposition matrix multiplications `V @ diag(sqrt(S)) @ V.t()` introduces O(n^3) computational bottlenecks and significant memory overhead. However, we can avoid this materialization entirely. Since `V` is unitary, the Frobenius norm is invariant under multiplication by `V` or `V.t()`. Thus, `||X @ Cov^{1/2}||_F` is strictly equivalent to `||X @ V @ diag(sqrt(S))||_F`. Similarly, we can compute the weighted matrix sequentially from right to left as `((W @ V) * sqrt(S)) @ V.t()`, reducing the overall complexity to O(m n^2).
+
+**Action:** Whenever calculating covariance-weighted error metrics or pre-conditioning weights using covariance eigen-pairs, directly apply the eigenvectors as linear operators and compute intermediate states as vectors or smaller matrices. Never materialize the full `n x n` `Cov^{1/2}` or `Cov^{-1/2}` matrices if you only need them to transform other matrices or compute norms.
