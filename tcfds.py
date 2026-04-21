@@ -24,6 +24,11 @@ try:
 except ImportError:
     def ram_mb(): return 0
 
+try:
+    import readline
+except ImportError:
+    pass
+
 def vram_mb():
     """Peak VRAM allocated on GPU 0 (single-GPU view)."""
     if torch.cuda.is_available():
