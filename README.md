@@ -1,6 +1,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![Version 6.6.0](https://img.shields.io/badge/version-6.6.0-informational.svg)](pyproject.toml)
 
 # TCFDS — Data-Aware Spectral Compression for LLMs
 
@@ -93,7 +94,7 @@ Sensitive layers (attention projections) get tighter tolerances. Robust layers (
                                               └───────────────────────┘
 ```
 
-Covariances are collected in a **single pass** (64 forward passes total, not 64 per block), which is the single biggest speedup over v6.2.
+Covariances are collected in a **single pass** (one sweep of the calibration set, not one per block). Since v6.6.0 the per-layer covariance product `x.T @ x` runs on the activation device (GPU), and only the small `n × n` result is copied to CPU — previous versions transferred the full activation tensor on every forward, which dominated calibration time on GPU setups.
 
 ---
 
@@ -154,6 +155,21 @@ python tcfds.py --load compressed.pt --chat-only
 | `--save` | None | Save compressed model to `.pt` file |
 | `--load` | None | Load a previously compressed model |
 | `--chat-only` | `False` | Skip verification, go straight to interactive chat |
+| `--dtype` | `float16` | Model precision: `float16`, `bfloat16`, `float32` |
+| `--trust-remote-code` | `False` | **SECURITY**: allow custom code execution from HuggingFace repos. Required for some architectures (Phi, Qwen variants). Off by default. |
+| `--unsafe-load` | `False` | **SECURITY**: disable `weights_only=True` when loading `.pt` files. Only use with fully trusted checkpoints — pickle allows arbitrary code execution. |
+
+---
+
+## Security
+
+TCFDS is designed to be safe by default:
+
+- **`.pt` files are loaded with `weights_only=True`** (PyTorch 2.0+) — blocks the pickle-based RCE vector that affects most PyTorch checkpoints in the wild. The save format is pure tensors + primitives, fully compatible with this restricted loader.
+- **`trust_remote_code` is off by default** on every HuggingFace call (tokenizer, config, model). A malicious or compromised HF repo can otherwise execute arbitrary Python at load time. Enable explicitly with `--trust-remote-code` when you know you need it.
+- **Checkpoints are structurally validated** on load — required keys, type checks, and a warning on unknown top-level keys (tampering signal).
+
+If a third party hands you a `.pt` file, load it once with the defaults. Only reach for `--unsafe-load` when you control the file end-to-end.
 
 ---
 
@@ -258,7 +274,7 @@ Model loading uses `low_cpu_mem_usage=True` without `torch_dtype` to avoid Windo
 
 ```
 tcfds/
-├── tcfds.py              # Main compression script (v6.3)
+├── tcfds.py              # Main compression script (version at __version__)
 ├── paper/
 │   ├── tcfds_paper.tex   # Research paper (LaTeX source)
 │   └── tcfds_paper.pdf   # Research paper (compiled)
@@ -294,6 +310,14 @@ The theoretical foundations of TCFDS are detailed in `paper/tcfds_paper.pdf`:
   license = {MIT}
 }
 ```
+
+---
+
+## Changelog
+
+**v6.6.0** — Perf: GPU-side covariance accumulation (`x.T @ x` on device, only the `n×n` result is copied to CPU), reuse of `||W @ C^{1/2}||` for the data-aware error denominator (saves one `n×m` matmul per layer), probe SVD runs at `niter=2` (rank estimation doesn't need precision), full `gc.collect()` is per-block rather than per-layer.
+
+**v6.5.0** — Security: `.pt` checkpoints load with `weights_only=True` by default; `trust_remote_code` is opt-in via `--trust-remote-code`; structural validation on checkpoint load. Cleanup: removed SHA-256 hashing in `verify()`, dead code in `log()`. Correctness: chat-format detection no longer preempts StableLM/Phi via a generic `'chat'` keyword.
 
 ---
 

@@ -8,7 +8,7 @@ Usage:
 Version string is the single source of truth at `__version__` below.
 """
 
-__version__ = "6.5.0"
+__version__ = "6.6.0"
 
 import torch, torch.nn as nn
 import math, time, gc, os, json, traceback, argparse, re
@@ -243,9 +243,11 @@ def log(msg):
         suffix = f" [VRAM={vram_mb():.0f}MB]"
     print(msg + suffix, flush=True)
 
-def free_mem():
-    """Aggressively free memory — call between layers."""
-    gc.collect()
+def free_mem(full=False):
+    """Release cached CUDA blocks. Pass full=True for a full gc.collect()
+    (expensive — keep it out of tight per-layer loops)."""
+    if full:
+        gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -322,7 +324,9 @@ def _do_svd(W, eps, total_energy, force_cpu=False):
             W = W.cpu()
 
     probe_k = min(min(m, n), max(64, min(m, n) // 4))
-    U_p, S_p, V_p = torch.svd_lowrank(W, q=probe_k, niter=3)
+    # niter=2 is enough for rank estimation (we only need the energy curve,
+    # not precise singular vectors). The final decomposition below uses niter=3.
+    U_p, S_p, V_p = torch.svd_lowrank(W, q=probe_k, niter=2)
     ecum = (S_p**2).cumsum(0) / total_energy
     reached = (ecum >= threshold)
 
@@ -368,8 +372,11 @@ def _do_svd(W, eps, total_energy, force_cpu=False):
 
 def data_aware_svd(W, Cov, eps):
     """Covariance-weighted SVD. Forces CPU for large matrices.
-    Returns (U, S, Vh, k, Cov_sqrt) — Cov_sqrt is returned so callers
-    can compute the data-aware error without a second eigendecomposition."""
+    Returns (U, S, Vh, k, Cov_sqrt, W_weighted_norm) — Cov_sqrt is returned
+    so callers can compute the data-aware error without a second
+    eigendecomposition; W_weighted_norm (= ||W @ Cov_sqrt||) is returned
+    because it was already computed here and re-deriving it would cost a
+    second n×m matmul per layer."""
     m, n = W.shape
     # svd_lowrank is iterative and GPU-safe; only force CPU for eigh (done in safe_eigh)
     force_cpu = False
@@ -383,7 +390,7 @@ def data_aware_svd(W, Cov, eps):
         log(f"    WARNING: NaN/Inf in covariance eigenvalues, falling back to standard SVD")
         del eigvals, eigvecs
         U, S, Vh, k = standard_svd(W, eps)
-        return U, S, Vh, k, None
+        return U, S, Vh, k, None, None
 
     sqrt_ev = eigvals.sqrt()
     inv_sqrt_ev = 1.0 / sqrt_ev
@@ -407,7 +414,11 @@ def data_aware_svd(W, Cov, eps):
         log(f"    WARNING: near-zero energy in weighted matrix, falling back to standard SVD")
         del Cov_sqrt, Cov_sqrt_inv, W_weighted
         U, S, Vh, k = standard_svd(W, eps)
-        return U, S, Vh, k, None
+        return U, S, Vh, k, None, None
+
+    # Reuse sqrt(total_energy) = ||W @ Cov_sqrt||_F for the data-aware error
+    # denominator — avoids a second n×m matmul in from_weight.
+    W_weighted_norm = math.sqrt(total_energy)
 
     # SVD on weighted matrix (on compute_device, which may be CPU)
     U, S, Vh, k = _do_svd(W_weighted, eps, total_energy, force_cpu=False)
@@ -418,10 +429,10 @@ def data_aware_svd(W, Cov, eps):
     # Transform V back from covariance-weighted space
     Vh_orig = Vh @ Cov_sqrt_inv.to(Vh.device)
     del Cov_sqrt_inv, Vh
-    free_mem()
 
-    # Return Cov_sqrt for reuse in error computation (avoids second eigh)
-    return U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k, Cov_sqrt.to(W.device)
+    # Return Cov_sqrt and W_weighted_norm for reuse in error computation.
+    return (U.to(W.device), S.to(W.device), Vh_orig.to(W.device), k,
+            Cov_sqrt.to(W.device), W_weighted_norm)
 
 def standard_svd(W, eps):
     """Standard SVD without data-aware weighting."""
@@ -445,8 +456,9 @@ class TCFDSLinear(nn.Module):
     def from_weight(cls, W_f32, bias_f32, eps, store_dtype, Cov=None):
         m, n = W_f32.shape
         Cov_sqrt = None
+        W_weighted_norm = None
         if Cov is not None:
-            U, S, Vh, k, Cov_sqrt = data_aware_svd(W_f32, Cov, eps)
+            U, S, Vh, k, Cov_sqrt, W_weighted_norm = data_aware_svd(W_f32, Cov, eps)
         else:
             U, S, Vh, k = standard_svd(W_f32, eps)
 
@@ -458,8 +470,10 @@ class TCFDSLinear(nn.Module):
         data_err = rel_err
 
         if Cov_sqrt is not None:
-            # Reuse Cov_sqrt from data_aware_svd (no second eigendecomposition)
-            data_err = (diff @ Cov_sqrt).norm().item() / max((W_f32 @ Cov_sqrt).norm().item(), 1e-12)
+            # Reuse Cov_sqrt from data_aware_svd, and the pre-computed
+            # ||W @ Cov_sqrt|| norm — saves one full n×m matmul per layer.
+            denom = W_weighted_norm if W_weighted_norm is not None else (W_f32 @ Cov_sqrt).norm().item()
+            data_err = (diff @ Cov_sqrt).norm().item() / max(denom, 1e-12)
 
         del W_approx, diff, Cov_sqrt
 
@@ -541,10 +555,9 @@ def collect_covs_for_layers(model, tokenizer, layer_names, calib_texts=None, seq
         seq_len = 64
     covs, tcounts, hooks = {}, {}, []
     target = set(layer_names)
-    dev = next(model.parameters()).device
 
-    # Pre-allocate covariance matrices to avoid per-sample conditional allocation
-    # and to let the hook skip the `if name not in covs` branch entirely.
+    # Pre-allocate covariance matrices (CPU) to avoid per-sample conditional
+    # allocation and let the hook skip the membership check entirely.
     for name, mod in model.named_modules():
         if name in target and isinstance(mod, nn.Linear):
             n = mod.in_features
@@ -553,10 +566,14 @@ def collect_covs_for_layers(model, tokenizer, layer_names, calib_texts=None, seq
 
     def make_hook(name):
         def fn(mod, inp, out):
-            x = inp[0].detach().float().cpu().reshape(-1, inp[0].shape[-1])
-            # torch.addmm(input, mat1, mat2, out=input) avoids allocating a
-            # temporary (n x n) matrix for the intermediate x.T @ x product.
-            torch.addmm(covs[name], x.t(), x, out=covs[name])
+            # PERF: compute x.T @ x on the *activation* device (typically GPU).
+            # GPU matmul is ~10-100× faster than the CPU variant, and we only
+            # transfer the small (n × n) result instead of the full activation
+            # tensor ((batch × seq) × n) — avoids massive H2D traffic that
+            # stalled calibration in earlier versions.
+            x = inp[0].detach().reshape(-1, inp[0].shape[-1]).float()
+            xtx = x.t() @ x
+            covs[name].add_(xtx.to('cpu', non_blocking=True))
             tcounts[name] += x.shape[0]
         return fn
 
@@ -717,7 +734,9 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
             m, n = mod.out_features, mod.in_features
             layer_idx += 1
 
-            # Free memory before each layer (critical for large down_proj layers)
+            # Free CUDA cache before each layer (critical for large down_proj
+            # layers). Skip gc.collect here — it's O(objects-alive) and was
+            # dominating per-layer overhead; run a full collect per-block instead.
             free_mem()
 
             try:
@@ -803,10 +822,10 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
                 log(f"  [{layer_idx}/{total_layers}] SKIP {name}: {e}")
                 traceback.print_exc()
 
-        free_mem()
+        free_mem(full=True)  # one gc.collect per block, not per layer
 
     del all_covs
-    free_mem()
+    free_mem(full=True)
     elapsed = time.time() - t0
     log(f"\n  Done: {len(results)}/{total_layers} layers in {elapsed:.0f}s ({elapsed/60:.1f}min)")
     return results, tot_orig, tot_comp
