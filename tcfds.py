@@ -1,20 +1,17 @@
 """
-TCFDS v6.4.0 - Data-Aware Compression + Adaptive Epsilon + GPU Support
-=====================================================================
-Fixes vs v6.4.0:
-  - Add auto-detection of chat formats for all major LLM families
-  - Supports Gemma, LLaMA 3, Qwen, Mistral, Mixtral, Phi, TinyLlama, StableLM
-  - Fix TCFDSFwd.backward: grad_U = z.t() @ g (was g.t() @ (z*S.softmax)), grad_V fixed
-  - Fix torch.load weights_only=False in load_compressed
-  - Bump to v6.4.0
+TCFDS — Data-Aware Spectral Compression for LLMs
 
 Usage:
   python tcfds.py --eps 0.25 --save compressed.pt
   python tcfds.py --load compressed.pt --chat-only
+
+Version string is the single source of truth at `__version__` below.
 """
 
+__version__ = "6.5.0"
+
 import torch, torch.nn as nn
-import math, time, gc, os, json, hashlib, traceback, argparse, re
+import math, time, gc, os, json, traceback, argparse, re
 import numpy as np
 from collections import defaultdict
 
@@ -115,6 +112,16 @@ def detect_chat_format(model_name):
             'suffix': '<|end|>',
             'requires_generation_marker': True,
         }
+    elif 'stablelm' in n:
+        return {
+            'type': 'stablelm',
+            'user': '<|user|>',
+            'model': '<|assistant|>',
+            'system': '',
+            'prefix': '',
+            'suffix': '<|endoftext|>',
+            'requires_generation_marker': True,
+        }
     elif 'tinyllama' in n or 'chat' in n:
         # TinyLlama / generic ChatML: <|user|>\n{prompt}\n</s>\n<|assistant|>\n
         return {
@@ -124,16 +131,6 @@ def detect_chat_format(model_name):
             'system': '',
             'prefix': '',
             'suffix': '</s>',
-            'requires_generation_marker': True,
-        }
-    elif 'stablelm' in n:
-        return {
-            'type': 'stablelm',
-            'user': '<|user|>',
-            'model': '<|assistant|>',
-            'system': '',
-            'prefix': '',
-            'suffix': '<|endoftext|>',
             'requires_generation_marker': True,
         }
     else:
@@ -236,15 +233,15 @@ def format_ref_for_ppl(ref_text, fmt):
         return ref_text
 
 def log(msg):
-    v = f" VRAM={vram_mb():.0f}MB" if torch.cuda.is_available() else ""
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    if not torch.cuda.is_available():
+        print(msg, flush=True)
+        return
+    if torch.cuda.device_count() > 1:
         v_all = " ".join(f"cuda:{i}={vram_all_mb()[i]:.0f}MB" for i in range(torch.cuda.device_count()))
-        v = f" [RAM={ram_mb():.0f}MB | {v_all}]"
-    elif torch.cuda.is_available():
-        v = f" VRAM={vram_mb():.0f}MB"
+        suffix = f" [RAM={ram_mb():.0f}MB | {v_all}]"
     else:
-        v = ""
-    print(f"{msg} [{v}]", flush=True)
+        suffix = f" [VRAM={vram_mb():.0f}MB]"
+    print(msg + suffix, flush=True)
 
 def free_mem():
     """Aggressively free memory — call between layers."""
@@ -818,6 +815,8 @@ def compress_streaming(model, tokenizer, base_eps, sensitivities):
 
 def save_compressed(model, results, meta, path):
     log(f"  Saving to {path}...")
+    # Plain-data container only (tensors + primitives) so it loads safely with
+    # torch.load(weights_only=True). Do NOT put model objects or custom classes here.
     model_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
     data = {
         'model_state': model_cpu,
@@ -826,7 +825,7 @@ def save_compressed(model, results, meta, path):
         'results': results,
         'meta': meta,
         'tcfds_layers': {},
-        'version': 'v6.4.0'
+        'version': __version__,
     }
     for name, mod in model.named_modules():
         if type(mod).__name__ == 'TCFDSLinear':
@@ -839,19 +838,53 @@ def save_compressed(model, results, meta, path):
     torch.save(data, path)
     log(f"  Saved: {os.path.getsize(path)/1e6:.0f} MB")
 
-def load_compressed(path):
+# Whitelist of keys we expect at the top level of a TCFDS checkpoint.
+_CHECKPOINT_KEYS = {'model_state', 'config', 'model_name', 'results',
+                    'meta', 'tcfds_layers', 'version'}
+
+def _validate_checkpoint(data, path):
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: checkpoint is not a dict (got {type(data).__name__})")
+    missing = {'model_state', 'config', 'model_name', 'tcfds_layers'} - set(data.keys())
+    if missing:
+        raise ValueError(f"{path}: missing required keys: {sorted(missing)}")
+    extra = set(data.keys()) - _CHECKPOINT_KEYS
+    if extra:
+        # Not fatal, but surface it — unknown keys can indicate a tampered file.
+        log(f"  WARNING: unknown keys in checkpoint: {sorted(extra)}")
+    if not isinstance(data['model_name'], str):
+        raise ValueError(f"{path}: model_name must be str")
+    if not isinstance(data['tcfds_layers'], dict):
+        raise ValueError(f"{path}: tcfds_layers must be dict")
+
+def load_compressed(path, trust_remote_code=False, unsafe=False):
     log(f"  Loading {path}...")
-    data = torch.load(path, map_location='cpu')
+    # SECURITY: torch.load uses pickle, which allows arbitrary code execution
+    # from a malicious .pt file. We require weights_only=True (the secure mode
+    # introduced in torch 2.0, default in 2.6+) unless the caller explicitly
+    # opts into legacy unsafe loading.
+    try:
+        data = torch.load(path, map_location='cpu', weights_only=not unsafe)
+    except TypeError:
+        # Very old torch without weights_only support.
+        if not unsafe:
+            raise RuntimeError(
+                "Your torch version does not support weights_only=True. "
+                "Upgrade to torch>=2.0, or pass --unsafe-load if you fully trust this file."
+            )
+        data = torch.load(path, map_location='cpu')
+    _validate_checkpoint(data, path)
+
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
     mn = data['model_name']
-    tok = AutoTokenizer.from_pretrained(mn, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(mn, trust_remote_code=trust_remote_code)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     try:
         config = AutoConfig.from_dict(data['config'])
     except Exception:
-        config = AutoConfig.from_pretrained(mn, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(mn, trust_remote_code=trust_remote_code)
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=trust_remote_code)
     for name, info in data['tcfds_layers'].items():
         t = TCFDSLinear(
             m=info['m'], n=info['n'], rank=info['rank'],
@@ -891,9 +924,6 @@ def verify(model, store_dtype=None):
             "ratio": round(o / c, 2),
             "frob_err": round(mod.rel_err, 6), "data_err": round(mod.data_err, 6),
             "full_mat": hf,
-            "U_hash": hashlib.sha256(
-                mod.U.detach().cpu().float().numpy().tobytes()
-            ).hexdigest()[:12]
         })
 
     nt = len(r["layers"])
@@ -969,7 +999,7 @@ def ppl(model, tok, text):
 # === MAIN ===
 
 def main():
-    pa = argparse.ArgumentParser(description="TCFDS v6.4.0 - Data-Aware LLM Compression")
+    pa = argparse.ArgumentParser(description=f"TCFDS v{__version__} - Data-Aware LLM Compression")
     pa.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                     help="HuggingFace model ID or local path")
     pa.add_argument("--eps", type=float, default=0.25,
@@ -983,13 +1013,19 @@ def main():
     pa.add_argument("--dtype", type=str, default="float16",
                     choices=["float16", "float32", "bfloat16"],
                     help="Model precision (float16 saves RAM, default: float16)")
+    pa.add_argument("--trust-remote-code", action="store_true",
+                    help="SECURITY: allow execution of custom code from HuggingFace models. "
+                         "Required for some architectures (Phi, Qwen variants). Off by default.")
+    pa.add_argument("--unsafe-load", action="store_true",
+                    help="SECURITY: disable weights_only=True when loading .pt files. "
+                         "Only use with fully trusted checkpoints — pickle allows arbitrary code execution.")
     a = pa.parse_args()
 
     dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
     load_dtype = dtype_map[a.dtype]
 
     print("=" * 65)
-    print(f"  TCFDS v6.4.0 (Data-Aware + GPU + Memory Safety) | eps={a.eps}")
+    print(f"  TCFDS v{__version__} (Data-Aware + GPU + Memory Safety) | eps={a.eps}")
     print(f"  Device: {DEVICE}")
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
@@ -1000,7 +1036,9 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     if a.load:
-        model, tok, results, meta = load_compressed(a.load)
+        model, tok, results, meta = load_compressed(
+            a.load, trust_remote_code=a.trust_remote_code, unsafe=a.unsafe_load
+        )
         if not a.chat_only:
             ref = "The Transformer uses self-attention to process sequences in parallel."
             try:
@@ -1034,7 +1072,9 @@ def main():
 
     # [1] Load model
     log(f"\n[1/6] Loading model...")
-    tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
+    if a.trust_remote_code:
+        log("  WARNING: --trust-remote-code is ON — executing code from the HF repo.")
+    tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=a.trust_remote_code)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     log(f"  Loading in {a.dtype}...")
@@ -1053,7 +1093,7 @@ def main():
         try:
             log(f"  Strategy: {name}...")
             model = AutoModelForCausalLM.from_pretrained(
-                a.model, trust_remote_code=True, **kwargs
+                a.model, trust_remote_code=a.trust_remote_code, **kwargs
             )
             log(f"  Model loaded via {name}")
             break
@@ -1156,7 +1196,7 @@ def main():
     if a.save:
         save_compressed(model, results, {
             'model_name': a.model, 'eps': a.eps,
-            'base_ppl': bppl, 'comp_ppl': cppl, 'version': 'v6.4.0'
+            'base_ppl': bppl, 'comp_ppl': cppl, 'version': __version__
         }, a.save)
 
     try:
@@ -1172,7 +1212,7 @@ def main():
     rpt["base_ppl"] = round(bppl, 2) if bppl != float('inf') else None
     rpt["comp_ppl"] = round(cppl, 2) if cppl != float('inf') else None
     rpt["results"] = results
-    rpt["version"] = "v6.4.0"
+    rpt["version"] = __version__
     ck = rpt["checks"]
     print(f"  CHECK 1 (modules replaced):  {'PASS' if ck['modules_replaced'] else 'FAIL'}")
     print(f"  CHECK 2 (memory reduced):    {'PASS' if ck['memory_reduced'] else 'FAIL'} "
@@ -1185,7 +1225,7 @@ def main():
 
 
     print(f"\n{'='*65}")
-    print(f"  TCFDS v6.4.0 Results")
+    print(f"  TCFDS v{__version__} Results")
     print(f"  Layers: {len(results)} ({n_attn} attn + {n_mlp} MLP) | "
           f"{ck['ratio']:.1f}x | {ck['savings_mb']:.1f}MB saved")
     if bppl != float('inf') and cppl != float('inf'):

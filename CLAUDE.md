@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **TCFDS** (Temporal Compression by Factored Dense Substitution) — compresses LLM weight matrices via data-aware spectral foliation (low-rank SVD factorization). Single-file Python project, no tests.
 
-- **Main file:** `tcfds.py` — v6.4.0 (version string in docstring + 3 places in main())
+- **Main file:** `tcfds.py` — version comes from `__version__` at top of `tcfds.py` (single source of truth). `pyproject.toml` version must match.
 - **Paper:** `paper/tcfds_paper.tex` (LaTeX source, compile with `pdflatex`)
 
 ## Running
@@ -54,10 +54,11 @@ verify()                          ← 3 structural checks
 
 ## Version Bump Checklist
 
-When bumping version (e.g. v6.4.0 → v6.4.1), update ALL of:
-1. `tcfds.py` docstring header
-2. `tcfds.py` argparse description string
-3. `tcfds.py` print banner string
-4. `tcfds.py` `save_compressed` meta dict
-5. `tcfds.py` `rpt["version"]`
-6. `pyproject.toml` `version = "..."`
+Update exactly two places:
+1. `__version__` in `tcfds.py`
+2. `version` in `pyproject.toml`
+
+## Security
+
+- `.pt` files are loaded with `weights_only=True` by default. Use `--unsafe-load` only with fully trusted checkpoints.
+- `trust_remote_code` is off by default on HF model loading. Pass `--trust-remote-code` for architectures that require custom code (e.g. some Phi/Qwen variants).
