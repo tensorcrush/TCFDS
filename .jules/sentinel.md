@@ -1,0 +1,4 @@
+## 2026-04-21 - Critical RCE and Deserialization vulnerabilities in model loading
+**Vulnerability:** Arbitrary Code Execution (RCE) via `trust_remote_code=True` and insecure deserialization via `torch.load` missing `weights_only=True`.
+**Learning:** `tcfds.py` previously hardcoded `trust_remote_code=True` across the model loading pipeline for HuggingFace APIs, which defaults to trusting code from external model repos and triggers automatic execution. Additionally, `torch.load` lacked the `weights_only=True` parameter which could lead to code execution via unpickling malicious payloads. Both vulnerabilities are extremely risky for AI tooling handling untrusted remote artifacts.
+**Prevention:** Always restrict `trust_remote_code` with an explicit opt-in argument (`--trust-remote-code`), defaulting to `False`. Always set `weights_only=True` when loading tensor data using `torch.load`.
